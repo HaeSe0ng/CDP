@@ -1,0 +1,22 @@
+TARGET=main
+OBJECTS=seq2seq.o seq2seq_link.o util.o main.o
+
+CC=g++
+CCFLAGS=-std=c++11 -Wall -O3
+LDLIBS=-L/usr/local/cuda/lib64 -lcudart -lcudadevrt
+NVCCFLAGS=-std=c++11 -arch=sm_61 
+seq2seq.o: seq2seq.cu
+	nvcc $(NVCCFLAGS) -O3 -rdc=true -c $^
+seq2seq_link.o: seq2seq.o
+	nvcc $(NVCCFLAGS) -dlink -o $@ $^ -lcudart -lcudadevrt
+main.o : main.cpp
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+
+clean:
+	rm -rf $(TARGET) $(OBJECTS)
+
+run: $(TARGET)
+	./$(TARGET) $(ARGS)

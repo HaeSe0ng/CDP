@@ -1,0 +1,1 @@
+{"input": ["cuda -keys=cuda,gpu -max_num_threads=1024 -thread_warp_size=32", "tutorial/matmul", [2048, 2048, 2048, "float32"], {}], "config": {"index": 0, "code_hash": null, "entity": []}, "result": [[0.0039422136], 0, 3.1886959075927734, 1595212583.4891746], "version": 0.2, "tvm_version": "0.7.dev1"}
