@@ -99,12 +99,11 @@ void seq2seq_encode(float *input_d, float *hidden_d, float *w_ih_d,
         totalElements);
   }
 }
-__global__ void seq2seq_decode(float *input_d, float *hidden_d, float *w_ih_d,
-                               float *w_hh_d, float *igate_d, float *hgate_d,
-                               float *b_ih_d, float *b_hh_d, float *cell_d,
-                               float *output_d, float *w_ho_d, int input_dim,
-                               int hidden_size, int totalElements,
-                               int totalInputs) {
+void seq2seq_decode(float *input_d, float *hidden_d, float *w_ih_d,
+                    float *w_hh_d, float *igate_d, float *hgate_d,
+                    float *b_ih_d, float *b_hh_d, float *cell_d,
+                    float *output_d, float *w_ho_d, int input_dim,
+                    int hidden_size, int totalElements, int totalInputs) {
   int i = 0;
   do {
     dim3 gridDim(1, 256, 1);
@@ -179,9 +178,9 @@ int seq2seq_inf(float *input, float *output, int input_dim, int seq_length,
   seq2seq_encode(input_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d,
                  b_hh_d, cell_d, output_d, w_ho_d, input_dim, hidden_size,
                  totalElements, totalInputs, seq_length);
-  seq2seq_decode<<<1, 1>>>(input_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d,
-                           b_ih_d, b_hh_d, cell_d, output_d, w_ho_d, input_dim,
-                           hidden_size, totalElements, totalInputs);
+  seq2seq_decode(input_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d,
+                 b_hh_d, cell_d, output_d, w_ho_d, input_dim, hidden_size,
+                 totalElements, totalInputs);
 
   cudaMemcpy(output, output_d, (sizeof(float) * totalInputs),
              cudaMemcpyDeviceToHost);

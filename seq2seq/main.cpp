@@ -16,15 +16,15 @@ using namespace std;
 int main()
 {
   srand(0);
-  int input_dim = 2048;
+  int input_dim = 256;
   int seq_length = 10;
   int batch_size = 1;
-  int hidden_size = 1024;
+  int hidden_size = 512;
   float *input, *output;
-  alloc_mat(&input, input_dim * seq_length, 1);
-  alloc_mat(&output, input_dim * seq_length, 1);
+  alloc_mat(&input, batch_size, input_dim * seq_length);
+  alloc_mat(&output, batch_size, input_dim * seq_length);
 
-  rand_mat(input, input_dim * seq_length, 1);
+  rand_mat(input, batch_size, input_dim * seq_length);
 
   seq2seq_inf(input, output, input_dim, seq_length, hidden_size, batch_size);
   return 0;
