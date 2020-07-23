@@ -1,0 +1,30 @@
+==3017== NVPROF is profiling process 3017, command: ./main
+==3017== Warning: Profiling results might be incorrect with current version of nvcc compiler used to compile cuda app. Compile with nvcc compiler 9.0 or later version to get correct profiling results. Ignore this warning if code is already compiled with the recommended nvcc version 
+==3017== Profiling application: ./main
+==3017== Profiling result:
+            Type  Time(%)      Time  Calls (host)  Calls (device)       Avg       Min       Max  Name
+ GPU activities:   37.79%  5.2039ms             0              15  346.93us  340.69us  361.68us  batch_matmul_1_4_16384_512_kernel(void*, void*, void*)
+                   27.82%  3.8310ms             6               -  638.50us  1.8240us  3.0282ms  [CUDA memcpy HtoD]
+                   18.87%  2.5988ms            20              30  51.976us  47.458us  58.147us  batch_matmul_1_4_2048_512_kernel(void*, void*, void*)
+                   12.06%  1.6611ms             1               0  1.6611ms  1.6611ms  1.6611ms  seq2seq_decode(float*, float*, float*, float*, float*, float*, float*, float*, float*, float*, float*, int, int, int, int, int, int)
+                    2.26%  310.86us             1               -  310.86us  310.86us  310.86us  [CUDA memcpy DtoH]
+                    1.18%  161.86us            10              15  6.4740us  2.5920us  10.465us  lstm_cell_kernel(float*, float*, float*, float*, float*, float*, float*, int, int)
+                    0.02%  3.0410us             2               -  1.5200us  1.3130us  1.7280us  [CUDA memset]
+      API calls:   94.73%  344.28ms             1               -  344.28ms  344.28ms  344.28ms  cudaMallocHost
+                    2.23%  8.1006ms             3               -  2.7002ms  5.6600us  7.2405ms  cudaEventSynchronize
+                    1.23%  4.4753ms             7               -  639.33us  11.859us  3.0327ms  cudaMemcpy
+                    0.72%  2.6064ms            96               -  27.149us     306ns  1.1867ms  cuDeviceGetAttribute
+                    0.36%  1.2981ms             1               -  1.2981ms  1.2981ms  1.2981ms  cuDeviceTotalMem
+                    0.29%  1.0519ms             9               -  116.88us  4.5040us  262.45us  cudaFree
+                    0.27%  990.21us            11               -  90.018us  3.6320us  209.86us  cudaMalloc
+                    0.09%  341.86us            31               -  11.027us  5.5760us  84.765us  cudaLaunchKernel
+                    0.06%  212.39us             1               -  212.39us  212.39us  212.39us  cuDeviceGetName
+                    0.01%  30.626us             2               -  15.313us  3.7650us  26.861us  cudaMemset
+                    0.01%  20.930us             6               -  3.4880us  2.4550us  5.5580us  cudaEventRecord
+                    0.00%  5.9840us             2               -  2.9920us     824ns  5.1600us  cudaEventCreate
+                    0.00%  5.3580us             3               -  1.7860us  1.2360us  2.3970us  cudaEventElapsedTime
+                    0.00%  5.2920us             1               -  5.2920us  5.2920us  5.2920us  cuDeviceGetPCIBusId
+                    0.00%  2.7000us             3               -     900ns     354ns  1.8060us  cuDeviceGetCount
+                    0.00%  2.2400us             2               -  1.1200us     513ns  1.7270us  cudaEventDestroy
+                    0.00%  1.7260us             2               -     863ns     412ns  1.3140us  cuDeviceGet
+                    0.00%     580ns             1               -     580ns     580ns     580ns  cuDeviceGetUuid
