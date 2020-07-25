@@ -1,1 +1,0 @@
-CUDALaunch Config:  grid=(512,1,1),  block=(32,1,1)
