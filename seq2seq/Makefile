@@ -1,7 +1,7 @@
 TARGET=main
 TARGET_NOCDP=main_nocdp
-OBJECTS=seq2seq_link.o seq2seq.o util.o main.o
-OBJECTS_NOCDP=seq2seq_nocdp.o util.o main.o
+OBJECTS=seq2seq_link.o seq2seq.o tvm_kernels.o util.o main.o
+OBJECTS_NOCDP=seq2seq_nocdp_link.o seq2seq_nocdp.o tvm_kernels.o util.o main.o
 
 CC=g++
 CCFLAGS=-std=c++11 -Wall -O3
@@ -9,13 +9,19 @@ LDLIBS=-L/usr/local/cuda/lib64 -lcudart
 NVCCFLAGS=-std=c++11 -arch=sm_61 
 
 seq2seq.o: seq2seq.cu
-	nvcc $(NVCCFLAGS) -O3 -rdc=true -c $^ 
+	nvcc $(NVCCFLAGS) -O3 -rdc=true -c $^
 
-seq2seq_link.o: seq2seq.o
+tvm_kernels.o: tvm_kernels.cu
+	nvcc $(NVCCFLAGS) -O3 -rdc=true -c $^
+
+seq2seq_link.o: seq2seq.o tvm_kernels.o
 	nvcc $(NVCCFLAGS) -dlink -o $@ $^
 
 seq2seq_nocdp.o: seq2seq_nocdp.cu
 	nvcc $(NVCCFLAGS) -O3 -c -o $@ $^
+
+seq2seq_nocdp_link.o: seq2seq_nocdp.o tvm_kernels.o
+	nvcc $(NVCCFLAGS) -dlink -o $@ $^
 
 main.o : main.cpp
 
