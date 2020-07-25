@@ -9,10 +9,10 @@ LDLIBS=-L/usr/local/cuda/lib64 -lcudart
 NVCCFLAGS=-std=c++11 -arch=sm_61 
 
 seq2seq.o: seq2seq.cu
-	nvcc $(NVCCFLAGS) -O3 -rdc=true -c $^ -lcudadevrt 
+	nvcc $(NVCCFLAGS) -O3 -rdc=true -c $^ 
 
 seq2seq_link.o: seq2seq.o
-	nvcc $(NVCCFLAGS) -dlink -o $@ $^ -lcudadevrt
+	nvcc $(NVCCFLAGS) -dlink -o $@ $^
 
 seq2seq_nocdp.o: seq2seq_nocdp.cu
 	nvcc $(NVCCFLAGS) -O3 -c -o $@ $^

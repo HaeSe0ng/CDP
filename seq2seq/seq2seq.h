@@ -1,3 +1,5 @@
 #pragma once
-#define TEMP_OUTPUT_SEQ_LENGTH 15
-int seq2seq_inf(float *input, float *output, int input_dim, int seq_length, int hidden_size, int batch_size, int tgt_vocab_size);
+
+int seq2seq_inf(int *input, int *output, int sos, int *eos,
+                int emb_dim, int seq_length, int hidden_size, int batch_size,
+                int src_vocab_size, int tgt_vocab_size, int max_len);

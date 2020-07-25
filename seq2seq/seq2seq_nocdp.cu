@@ -1,14 +1,16 @@
 #include <cuda.h>
-#include <cuda_device_runtime_api.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 
 #include <cstdlib>
+#include <fstream>
+#include <iostream>
 
 #include "seq2seq.h"
 #include "util.h"
 
 #define AT_APPLY_THREADS_PER_BLOCK 512
+#define TEMP_OUTPUT_SEQ_LENGTH 15
 
 void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K);
 
@@ -70,64 +72,179 @@ __global__ void lstm_cell_kernel(float *input, float *hidden, float *bias1,
     *cy = f_cy;
   }
 }
-void seq2seq_encode(float *input_d, float *hidden_d, float *w_ih_d,
-                    float *w_hh_d, float *igate_d, float *hgate_d,
-                    float *b_ih_d, float *b_hh_d, float *cell_d,
-                    float *output_d, float *w_ho_d, int bsz, int input_dim,
-                    int hidden_size, int totalElements, int totalInputs,
-                    int seq_length) {
-  for (int i = 0; i < seq_length; i++) {
-    batch_matmul(input_d + input_dim * i, w_ih_d, igate_d, 1, bsz,
-                 4 * hidden_size, input_dim); // bsz, 4*hidden_size, input_dim
-    batch_matmul(hidden_d, w_hh_d, hgate_d, 1, bsz, 4 * hidden_size,
-                 hidden_size); // bsz, 4*hidden_size, hidden_size
-    lstm_cell_kernel<<<totalElements / AT_APPLY_THREADS_PER_BLOCK,
-                       AT_APPLY_THREADS_PER_BLOCK>>>(
-        igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
-        totalElements);
+__global__ void argmax_kernel(float *input_d, int *output_d, int bsz,
+                              int input_len) {
+  float temp_topv, temp_v;
+  int temp_topi;
+  for (int b = 0; b < bsz; b++) {
+    temp_topv = 0;
+    temp_topi = 0;
+    for (int vocab_idx = 0; vocab_idx < input_len; vocab_idx++) {
+      temp_v = input_d[b * input_len + vocab_idx];
+      if (temp_v > temp_topv) {
+        temp_topi = vocab_idx;
+        temp_topv = temp_v;
+      }
+    }
+    output_d[b] = temp_topi;
+    // printf("argmax] b=%d,temp_topi=%d,temp_topv=%f\n", b, temp_topi,
+    // temp_topv);
   }
 }
-void seq2seq_decode(float *input_d, float *hidden_d, float *w_ih_d,
-                    float *w_hh_d, float *igate_d, float *hgate_d,
-                    float *b_ih_d, float *b_hh_d, float *cell_d,
-                    float *output_d, float *w_ho_d, float *output, int bsz,
-                    int input_dim, int hidden_size, int totalElements,
-                    int totalInputs, int tgt_vocab_size) {
-  int i = 0;
-  do {
-
-    batch_matmul(input_d + input_dim * i, w_ih_d, igate_d, 1, bsz,
-                 4 * hidden_size, input_dim); // bsz, 4*hidden_size, input_dim
-    batch_matmul(hidden_d, w_hh_d, hgate_d, 1, bsz, 4 * hidden_size,
-                 hidden_size); // bsz, 4*hidden_size, hidden_size
-    lstm_cell_kernel<<<totalElements / AT_APPLY_THREADS_PER_BLOCK,
-                       AT_APPLY_THREADS_PER_BLOCK>>>(
-        igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
-        totalElements);
-    batch_matmul(hidden_d, w_ho_d, output_d + tgt_vocab_size * i, 1, bsz,
-                 tgt_vocab_size,
-                 hidden_size); // bsz, tgt_vocab_size, hidden_size
-    /*cudaMemcpy(output + tgt_vocab_size * i, output_d + tgt_vocab_size * i,
-               (sizeof(float) * bsz * tgt_vocab_size),
-       cudaMemcpyDeviceToHost);*/
-    i++;
-  } while (i < TEMP_OUTPUT_SEQ_LENGTH);
+void lstm(float *input_d, float *hidden_d, float *w_ih_d, float *w_hh_d,
+          float *igate_d, float *hgate_d, float *b_ih_d, float *b_hh_d,
+          float *cell_d, int bsz, int input_dim, int hidden_size,
+          int totalElements) {
+  batch_matmul(input_d, w_ih_d, igate_d, 1, bsz, 4 * hidden_size,
+               input_dim); // bsz, 4*hidden_size, input_dim
+  batch_matmul(hidden_d, w_hh_d, hgate_d, 1, bsz, 4 * hidden_size,
+               hidden_size); // bsz, 4*hidden_size, hidden_size
+  lstm_cell_kernel<<<totalElements / AT_APPLY_THREADS_PER_BLOCK,
+                     AT_APPLY_THREADS_PER_BLOCK>>>(
+      igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
+      totalElements);
 }
-int seq2seq_inf(float *input, float *output, int input_dim, int seq_length,
-                int hidden_size, int batch_size, int tgt_vocab_size) {
-  srand(10);
-  cudaMallocHost((void **)&output, sizeof(float) * sizeof(float) * batch_size *
-                                       tgt_vocab_size * TEMP_OUTPUT_SEQ_LENGTH);
-  int totalElements = batch_size * hidden_size;
-  int totalInputs = batch_size * input_dim;
-  float *w_ih, *w_hh, *b_ih, *b_hh, *w_ho;
-  float *input_d, *hidden_d, *igate_d, *hgate_d, *cell_d, *w_ih_d, *w_hh_d,
-      *b_ih_d, *b_hh_d, *w_ho_d, *output_d;
+void embedding(int *input, int emb_dim, int bsz, float *emb_tbl_d,
+               float *emb_vec_d) {
+  for (int b = 0; b < bsz; b++) {
+    cudaMemcpy(emb_vec_d + b * emb_dim, emb_tbl_d + input[b] * emb_dim,
+               (sizeof(float) * emb_dim), cudaMemcpyDeviceToDevice);
+  }
+}
+void argmax(float *input_d, int *output_d, int bsz, int input_len) {
+  argmax_kernel<<<1, 1>>>(input_d, output_d, bsz, input_len);
+}
+void seq2seq_encode(int *input, float *emb_tbl_d, float *emb_vec_d,
+                    float *hidden_d, float *w_ih_d, float *w_hh_d,
+                    float *igate_d, float *hgate_d, float *b_ih_d,
+                    float *b_hh_d, float *cell_d, float *w_ho_d, int bsz,
+                    int emb_dim, int hidden_size, int totalElements,
+                    int seq_length) {
+  for (int i = 0; i < seq_length; i++) {
+    embedding(input + i * bsz, emb_dim, bsz, emb_tbl_d, emb_vec_d);
 
-  cudaMalloc((void **)&input_d,
-             sizeof(float) * batch_size * input_dim * seq_length);
-  cudaMalloc((void **)&output_d, sizeof(float) * batch_size * tgt_vocab_size *
-                                     TEMP_OUTPUT_SEQ_LENGTH);
+    lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
+         cell_d, bsz, emb_dim, hidden_size, totalElements);
+  }
+}
+void seq2seq_decode_save(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
+                         float *w_ih_d, float *w_hh_d, float *igate_d,
+                         float *hgate_d, float *b_ih_d, float *b_hh_d,
+                         float *cell_d, float *output_onehot_d, float *w_ho_d,
+                         int *output_d, int *output, int *eos, int bsz,
+                         int emb_dim, int hidden_size, int totalElements,
+                         int tgt_vocab_size, int max_len, int *sos_batch) {
+  ofstream out;
+  char out_fname[20];
+  sprintf(out_fname, "out_%d.dat", bsz);
+  out.open(out_fname, ios::out | ios::binary);
+  int i;
+  for (i = 0; i < TEMP_OUTPUT_SEQ_LENGTH; i++) {
+    if (i == 0)
+      embedding(sos_batch, emb_dim, bsz, emb_tbl_d, emb_vec_d);
+    else
+      embedding(output + bsz * (i - 1), emb_dim, bsz, emb_tbl_d, emb_vec_d);
+    lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
+         cell_d, bsz, emb_dim, hidden_size, totalElements);
+    batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
+                 1, bsz, tgt_vocab_size,
+                 hidden_size); // bsz, tgt_vocab_size, hidden_size
+    argmax(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i, bsz,
+           tgt_vocab_size);
+    cudaMemcpy(output + bsz * i, output_d + bsz * i, (sizeof(int) * bsz),
+               cudaMemcpyDeviceToHost);
+    /*
+        float *output_onehot;
+        alloc_mat<float>(&output_onehot, bsz, tgt_vocab_size);
+        cudaMemcpy(output_onehot, output_onehot_d + bsz * tgt_vocab_size * i,
+                   (sizeof(float) * bsz * tgt_vocab_size),
+       cudaMemcpyDeviceToHost);
+
+        for (int ii = 0; ii < bsz; ii++) {
+          for (int jj = 0; jj < 10; jj++)
+            printf("%+.3f ", output_onehot[ii * tgt_vocab_size + jj]);
+          printf("\n");
+        }
+        free(output_onehot);*/
+  }
+  int *output_eos = output + (i - 1) * bsz;
+  for (int b = 0; b < bsz; b++) {
+    printf("b=%d, eos=%d\n", b, output_eos[b]);
+  }
+  out.write(reinterpret_cast<const char *>(output_eos), sizeof(int) * bsz);
+  out.close();
+}
+void seq2seq_decode(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
+                    float *w_ih_d, float *w_hh_d, float *igate_d,
+                    float *hgate_d, float *b_ih_d, float *b_hh_d, float *cell_d,
+                    float *output_onehot_d, float *w_ho_d, int *output_d,
+                    int *output, int *eos, int bsz, int emb_dim,
+                    int hidden_size, int totalElements, int tgt_vocab_size,
+                    int max_len, int *sos_batch) {
+  int i;
+  bool is_end;
+  for (i = 0; i < max_len; i++) {
+    is_end = true;
+    if (i == 0)
+      embedding(sos_batch, emb_dim, bsz, emb_tbl_d, emb_vec_d);
+    else
+      embedding(output + bsz * (i - 1), emb_dim, bsz, emb_tbl_d, emb_vec_d);
+    lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
+         cell_d, bsz, emb_dim, hidden_size, totalElements);
+    batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
+                 1, bsz, tgt_vocab_size,
+                 hidden_size); // bsz, tgt_vocab_size, hidden_size
+    argmax(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i, bsz,
+           tgt_vocab_size);
+    cudaMemcpy(output + bsz * i, output_d + bsz * i, (sizeof(int) * bsz),
+               cudaMemcpyDeviceToHost);
+    for (int b = 0; b < bsz; b++) {
+      // printf("i=%d, output[%d]=%d, eos[%d]=%d\n", i, bsz * i + b,
+      //       output[bsz * i + b], b, eos[b]);
+      if (output[bsz * i + b] != eos[b]) {
+        is_end = false;
+        break;
+      }
+    }
+    if (is_end) {
+      printf("end: out_seq_len=%d\n", i + 1);
+      break;
+    }
+  }
+}
+int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
+                int seq_length, int hidden_size, int batch_size,
+                int src_vocab_size, int tgt_vocab_size, int max_len) {
+  cudaMallocHost((void **)&output, sizeof(int) * batch_size * max_len);
+  int *sos_batch;
+  alloc_mat(&sos_batch, 1, batch_size);
+  memset_mat(sos_batch, sos, 1, batch_size);
+  int totalElements = batch_size * hidden_size;
+  int *output_d;
+  float *w_ih_enc, *w_hh_enc, *b_ih_enc, *b_hh_enc;
+  float *w_ih_dec, *w_hh_dec, *b_ih_dec, *b_hh_dec, *w_ho;
+  float *emb_tbl_enc, *emb_tbl_dec;
+  float *hidden_d, *igate_d, *hgate_d, *cell_d;
+  float *w_ih_enc_d, *w_hh_enc_d, *b_ih_enc_d, *b_hh_enc_d;
+  float *w_ih_dec_d, *w_hh_dec_d, *b_ih_dec_d, *b_hh_dec_d, *w_ho_d;
+  float *output_onehot_d, *emb_tbl_enc_d, *emb_tbl_dec_d, *emb_vec_d;
+
+  alloc_rand_mat<float>(&emb_tbl_enc, src_vocab_size, emb_dim);
+  cudaMalloc((void **)&emb_tbl_enc_d, sizeof(float) * src_vocab_size * emb_dim);
+  alloc_rand_mat<float>(&emb_tbl_dec, tgt_vocab_size, emb_dim);
+  cudaMalloc((void **)&emb_tbl_dec_d, sizeof(float) * tgt_vocab_size * emb_dim);
+  cudaMalloc((void **)&emb_vec_d, sizeof(float) * batch_size * emb_dim);
+
+  cudaMemcpy(emb_tbl_enc_d, emb_tbl_enc,
+             (sizeof(float) * src_vocab_size * emb_dim),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(emb_tbl_dec_d, emb_tbl_dec,
+             (sizeof(float) * tgt_vocab_size * emb_dim),
+             cudaMemcpyHostToDevice);
+
+  cudaMalloc((void **)&output_onehot_d,
+             sizeof(float) * batch_size * tgt_vocab_size * max_len);
+  cudaMalloc((void **)&output_d, sizeof(int) * batch_size * max_len);
 
   cudaMalloc((void **)&hidden_d, sizeof(float) * batch_size * hidden_size);
   cudaMalloc((void **)&cell_d, sizeof(float) * batch_size * hidden_size);
@@ -135,31 +252,53 @@ int seq2seq_inf(float *input, float *output, int input_dim, int seq_length,
   cudaMalloc((void **)&igate_d, sizeof(float) * batch_size * (4 * hidden_size));
   cudaMalloc((void **)&hgate_d, sizeof(float) * batch_size * (4 * hidden_size));
 
-  cudaMalloc((void **)&w_ih_d, sizeof(float) * (4 * hidden_size) * input_dim);
-  cudaMalloc((void **)&w_hh_d, sizeof(float) * (4 * hidden_size) * hidden_size);
-  cudaMalloc((void **)&b_ih_d, sizeof(float) * 4 * hidden_size);
-  cudaMalloc((void **)&b_hh_d, sizeof(float) * 4 * hidden_size);
+  cudaMalloc((void **)&w_ih_enc_d, sizeof(float) * (4 * hidden_size) * emb_dim);
+  cudaMalloc((void **)&w_hh_enc_d,
+             sizeof(float) * (4 * hidden_size) * hidden_size);
+  cudaMalloc((void **)&b_ih_enc_d, sizeof(float) * 4 * hidden_size);
+  cudaMalloc((void **)&b_hh_enc_d, sizeof(float) * 4 * hidden_size);
+
+  cudaMalloc((void **)&w_ih_dec_d, sizeof(float) * (4 * hidden_size) * emb_dim);
+  cudaMalloc((void **)&w_hh_dec_d,
+             sizeof(float) * (4 * hidden_size) * hidden_size);
+  cudaMalloc((void **)&b_ih_dec_d, sizeof(float) * 4 * hidden_size);
+  cudaMalloc((void **)&b_hh_dec_d, sizeof(float) * 4 * hidden_size);
   cudaMalloc((void **)&w_ho_d, sizeof(float) * tgt_vocab_size * hidden_size);
 
   cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
   cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
-  alloc_rand_mat(&w_ih, (4 * hidden_size), input_dim);
-  alloc_rand_mat(&w_hh, (4 * hidden_size), hidden_size);
-  alloc_rand_mat(&b_ih, 1, 4 * hidden_size);
-  alloc_rand_mat(&b_hh, 1, 4 * hidden_size);
-  alloc_rand_mat(&w_ho, tgt_vocab_size, hidden_size);
+  alloc_rand_mat<float>(&w_ih_enc, (4 * hidden_size), emb_dim);
+  alloc_rand_mat<float>(&w_hh_enc, (4 * hidden_size), hidden_size);
+  alloc_rand_mat<float>(&b_ih_enc, 1, 4 * hidden_size);
+  alloc_rand_mat<float>(&b_hh_enc, 1, 4 * hidden_size);
 
-  cudaMemcpy(input_d, input,
-             (sizeof(float) * batch_size * input_dim * seq_length),
+  cudaMemcpy(w_ih_enc_d, w_ih_enc,
+             (sizeof(float) * emb_dim * (4 * hidden_size)),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(w_ih_d, w_ih, (sizeof(float) * input_dim * (4 * hidden_size)),
+  cudaMemcpy(w_hh_enc_d, w_hh_enc,
+             (sizeof(float) * hidden_size * (4 * hidden_size)),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(w_hh_d, w_hh, (sizeof(float) * hidden_size * (4 * hidden_size)),
+  cudaMemcpy(b_ih_enc_d, b_ih_enc, (sizeof(float) * 4 * hidden_size),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(b_ih_d, b_ih, (sizeof(float) * 4 * hidden_size),
+  cudaMemcpy(b_hh_enc_d, b_hh_enc, (sizeof(float) * 4 * hidden_size),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(b_hh_d, b_hh, (sizeof(float) * 4 * hidden_size),
+
+  alloc_rand_mat<float>(&w_ih_dec, (4 * hidden_size), emb_dim);
+  alloc_rand_mat<float>(&w_hh_dec, (4 * hidden_size), hidden_size);
+  alloc_rand_mat<float>(&b_ih_dec, 1, 4 * hidden_size);
+  alloc_rand_mat<float>(&b_hh_dec, 1, 4 * hidden_size);
+  cudaMemcpy(w_ih_dec_d, w_ih_dec,
+             (sizeof(float) * emb_dim * (4 * hidden_size)),
              cudaMemcpyHostToDevice);
+  cudaMemcpy(w_hh_dec_d, w_hh_dec,
+             (sizeof(float) * hidden_size * (4 * hidden_size)),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(b_ih_dec_d, b_ih_dec, (sizeof(float) * 4 * hidden_size),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(b_hh_dec_d, b_hh_dec, (sizeof(float) * 4 * hidden_size),
+             cudaMemcpyHostToDevice);
+
+  alloc_rand_mat<float>(&w_ho, tgt_vocab_size, hidden_size);
   cudaMemcpy(w_ho_d, w_ho, (sizeof(float) * hidden_size * tgt_vocab_size),
              cudaMemcpyHostToDevice);
 
@@ -169,9 +308,10 @@ int seq2seq_inf(float *input, float *output, int input_dim, int seq_length,
   cudaEventRecord(start);
   // main logic
 
-  seq2seq_encode(input_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d,
-                 b_hh_d, cell_d, output_d, w_ho_d, batch_size, input_dim,
-                 hidden_size, totalElements, totalInputs, seq_length);
+  seq2seq_encode(input, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
+                 w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d, cell_d,
+                 w_ho_d, batch_size, emb_dim, hidden_size, totalElements,
+                 seq_length);
 
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
@@ -180,11 +320,11 @@ int seq2seq_inf(float *input, float *output, int input_dim, int seq_length,
   printf("[noCDP_encode]execution time: %fms\n", elapsed_time);
   cudaEventRecord(start);
 
-  seq2seq_decode(input_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d,
-                 b_hh_d, cell_d, output_d, w_ho_d, output, batch_size,
-                 input_dim, hidden_size, totalElements, totalInputs,
-                 tgt_vocab_size);
-
+  seq2seq_decode(emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d,
+                 igate_d, hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d,
+                 output_onehot_d, w_ho_d, output_d, output, eos, batch_size,
+                 emb_dim, hidden_size, totalElements, tgt_vocab_size, max_len,
+                 sos_batch);
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&elapsed_time, start, stop);
@@ -192,15 +332,38 @@ int seq2seq_inf(float *input, float *output, int input_dim, int seq_length,
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
-  cudaFree(input_d);
+  cudaFree(emb_tbl_enc_d);
+  cudaFree(emb_tbl_dec_d);
+  cudaFree(output_onehot_d);
   cudaFree(output_d);
   cudaFree(hidden_d);
   cudaFree(cell_d);
-  cudaFree(w_ih_d);
-  cudaFree(w_hh_d);
-  cudaFree(b_ih_d);
-  cudaFree(b_hh_d);
+  cudaFree(igate_d);
+  cudaFree(hgate_d);
+  cudaFree(w_ih_enc_d);
+  cudaFree(w_hh_enc_d);
+  cudaFree(b_ih_enc_d);
+  cudaFree(b_hh_enc_d);
+  cudaFree(w_ih_dec_d);
+  cudaFree(w_hh_dec_d);
+  cudaFree(b_ih_dec_d);
+  cudaFree(b_hh_dec_d);
   cudaFree(w_ho_d);
+
+  free(sos_batch);
+  cudaFreeHost(output);
+  free(w_ih_enc);
+  free(w_hh_enc);
+  free(b_ih_enc);
+  free(b_hh_enc);
+  free(w_ih_dec);
+  free(w_hh_dec);
+  free(b_ih_dec);
+  free(b_hh_dec);
+  free(w_ho);
+  free(emb_tbl_enc);
+  free(emb_tbl_dec);
+
   return 0;
 }
 
@@ -1523,6 +1686,514 @@ __global__ void batch_matmul_1_4_16384_512_kernel(void *__restrict__ A,
   }
 }
 
+__global__ void batch_matmul_1_64_2048_512_kernel(void *__restrict__ A,
+                                                  void *__restrict__ B,
+                                                  void *__restrict__ compute) {
+  for (int temp_i = 0; temp_i < 100; temp_i++) {
+    float compute_local[32];
+    __shared__ float A_shared[1024];
+    __shared__ float B_shared[1024];
+    float A_shared_local[16];
+    float B_shared_local[2];
+    for (int i_c_init = 0; i_c_init < 16; ++i_c_init) {
+      for (int j_c_init = 0; j_c_init < 2; ++j_c_init) {
+        compute_local[(((i_c_init * 2) + j_c_init))] = 0.000000e+00f;
+      }
+    }
+    for (int k_outer = 0; k_outer < 16; ++k_outer) {
+      __syncthreads();
+      for (int ax1_inner = 0; ax1_inner < 16; ++ax1_inner) {
+#pragma unroll
+        for (int ax2_inner = 0; ax2_inner < 2; ++ax2_inner) {
+          A_shared[(((((((int)threadIdx.y) * 512) + (ax1_inner * 32)) +
+                      (((int)threadIdx.x) * 2)) +
+                     ax2_inner))] =
+              ((float *)A)[(((((((((int)blockIdx.y) * 16384) +
+                                 (((int)threadIdx.y) * 8192)) +
+                                (ax1_inner * 512)) +
+                               (k_outer * 32)) +
+                              (((int)threadIdx.x) * 2)) +
+                             ax2_inner))];
+        }
+      }
+      for (int ax1_inner1 = 0; ax1_inner1 < 16; ++ax1_inner1) {
+#pragma unroll
+        for (int ax2_inner1 = 0; ax2_inner1 < 2; ++ax2_inner1) {
+          B_shared[(((((((int)threadIdx.y) * 512) + (ax1_inner1 * 32)) +
+                      (((int)threadIdx.x) * 2)) +
+                     ax2_inner1))] =
+              ((float *)B)[(((((((((int)blockIdx.x) * 16384) +
+                                 (((int)threadIdx.y) * 8192)) +
+                                (ax1_inner1 * 512)) +
+                               (k_outer * 32)) +
+                              (((int)threadIdx.x) * 2)) +
+                             ax2_inner1))];
+        }
+      }
+      __syncthreads();
+      for (int k_inner = 0; k_inner < 32; ++k_inner) {
+#pragma unroll
+        for (int ax1 = 0; ax1 < 16; ++ax1) {
+          A_shared_local[(ax1)] =
+              A_shared[((((((int)threadIdx.y) * 512) + (ax1 * 32)) + k_inner))];
+        }
+#pragma unroll
+        for (int ax11 = 0; ax11 < 2; ++ax11) {
+          B_shared_local[(ax11)] =
+              B_shared[((((((int)threadIdx.x) * 64) + (ax11 * 32)) + k_inner))];
+        }
+        for (int i_c = 0; i_c < 16; ++i_c) {
+#pragma unroll
+          for (int j_c = 0; j_c < 2; ++j_c) {
+            compute_local[(((i_c * 2) + j_c))] =
+                (compute_local[(((i_c * 2) + j_c))] +
+                 (A_shared_local[(i_c)] * B_shared_local[(j_c)]));
+          }
+        }
+      }
+    }
+    for (int i_inner_inner = 0; i_inner_inner < 16; ++i_inner_inner) {
+#pragma unroll
+      for (int j_inner_inner = 0; j_inner_inner < 2; ++j_inner_inner) {
+        ((float *)compute)[(
+            ((((((((int)blockIdx.y) * 65536) + (((int)threadIdx.y) * 32768)) +
+                (i_inner_inner * 2048)) +
+               (((int)blockIdx.x) * 32)) +
+              (((int)threadIdx.x) * 2)) +
+             j_inner_inner))] =
+            compute_local[(((i_inner_inner * 2) + j_inner_inner))];
+      }
+    }
+  }
+}
+
+__global__ void batch_matmul_1_64_16384_512_kernel(void *__restrict__ A,
+                                                   void *__restrict__ B,
+                                                   void *__restrict__ compute) {
+  for (int temp_i = 0; temp_i < 100; temp_i++) {
+    float compute_local[64];
+    __shared__ float A_shared[2048];
+    __shared__ float B_shared[2048];
+    float A_shared_local[32];
+    float B_shared_local[2];
+    for (int i_c_init = 0; i_c_init < 32; ++i_c_init) {
+      for (int j_c_init = 0; j_c_init < 2; ++j_c_init) {
+        compute_local[(((i_c_init * 2) + j_c_init))] = 0.000000e+00f;
+      }
+    }
+    for (int k_outer = 0; k_outer < 16; ++k_outer) {
+      __syncthreads();
+      A_shared[(((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)))] =
+          ((float *)A)[((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                         ((int)threadIdx.x)))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 32))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         512))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 64))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         1024))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 96))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         1536))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 128))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         2048))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 160))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         2560))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 192))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         3072))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 224))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         3584))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 256))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         4096))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 288))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         4608))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 320))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         5120))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 352))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         5632))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 384))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         6144))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 416))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         6656))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 448))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         7168))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 480))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         7680))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 512))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         8192))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 544))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         8704))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 576))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         9216))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 608))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         9728))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 640))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         10240))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 672))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         10752))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 704))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         11264))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 736))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         11776))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 768))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         12288))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 800))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         12800))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 832))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         13312))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 864))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         13824))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 896))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         14336))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 928))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         14848))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 960))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         15360))];
+      A_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 992))] =
+          ((float *)A)[(((((((int)threadIdx.y) * 16384) + (k_outer * 32)) +
+                          ((int)threadIdx.x)) +
+                         15872))];
+      B_shared[(((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)))] =
+          ((float *)B)[(
+              ((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                (k_outer * 32)) +
+               ((int)threadIdx.x)))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 32))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               512))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 64))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               1024))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 96))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               1536))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 128))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               2048))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 160))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               2560))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 192))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               3072))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 224))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               3584))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 256))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               4096))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 288))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               4608))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 320))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               5120))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 352))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               5632))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 384))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               6144))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 416))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               6656))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 448))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               7168))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 480))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               7680))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 512))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               8192))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 544))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               8704))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 576))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               9216))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 608))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               9728))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 640))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               10240))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 672))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               10752))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 704))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               11264))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 736))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               11776))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 768))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               12288))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 800))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               12800))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 832))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               13312))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 864))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               13824))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 896))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               14336))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 928))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               14848))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 960))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               15360))];
+      B_shared[((((((int)threadIdx.y) * 1024) + ((int)threadIdx.x)) + 992))] =
+          ((float *)B)[(
+              (((((((int)blockIdx.x) * 32768) + (((int)threadIdx.y) * 16384)) +
+                 (k_outer * 32)) +
+                ((int)threadIdx.x)) +
+               15872))];
+      __syncthreads();
+      for (int k_inner = 0; k_inner < 32; ++k_inner) {
+        A_shared_local[(0)] =
+            A_shared[(((((int)threadIdx.y) * 1024) + k_inner))];
+        A_shared_local[(1)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 32))];
+        A_shared_local[(2)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 64))];
+        A_shared_local[(3)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 96))];
+        A_shared_local[(4)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 128))];
+        A_shared_local[(5)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 160))];
+        A_shared_local[(6)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 192))];
+        A_shared_local[(7)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 224))];
+        A_shared_local[(8)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 256))];
+        A_shared_local[(9)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 288))];
+        A_shared_local[(10)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 320))];
+        A_shared_local[(11)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 352))];
+        A_shared_local[(12)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 384))];
+        A_shared_local[(13)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 416))];
+        A_shared_local[(14)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 448))];
+        A_shared_local[(15)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 480))];
+        A_shared_local[(16)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 512))];
+        A_shared_local[(17)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 544))];
+        A_shared_local[(18)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 576))];
+        A_shared_local[(19)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 608))];
+        A_shared_local[(20)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 640))];
+        A_shared_local[(21)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 672))];
+        A_shared_local[(22)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 704))];
+        A_shared_local[(23)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 736))];
+        A_shared_local[(24)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 768))];
+        A_shared_local[(25)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 800))];
+        A_shared_local[(26)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 832))];
+        A_shared_local[(27)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 864))];
+        A_shared_local[(28)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 896))];
+        A_shared_local[(29)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 928))];
+        A_shared_local[(30)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 960))];
+        A_shared_local[(31)] =
+            A_shared[((((((int)threadIdx.y) * 1024) + k_inner) + 992))];
+        B_shared_local[(0)] = B_shared[(((((int)threadIdx.x) * 64) + k_inner))];
+        B_shared_local[(1)] =
+            B_shared[((((((int)threadIdx.x) * 64) + k_inner) + 32))];
+        for (int i_c = 0; i_c < 32; ++i_c) {
+          compute_local[((i_c * 2))] =
+              (compute_local[((i_c * 2))] +
+               (A_shared_local[(i_c)] * B_shared_local[(0)]));
+          compute_local[(((i_c * 2) + 1))] =
+              (compute_local[(((i_c * 2) + 1))] +
+               (A_shared_local[(i_c)] * B_shared_local[(1)]));
+        }
+      }
+    }
+    for (int i_inner_inner = 0; i_inner_inner < 32; ++i_inner_inner) {
+      ((float *)compute)[(
+          ((((((int)threadIdx.y) * 524288) + (i_inner_inner * 16384)) +
+            (((int)blockIdx.x) * 64)) +
+           (((int)threadIdx.x) * 2)))] = compute_local[((i_inner_inner * 2))];
+      ((float *)compute)[(
+          (((((((int)threadIdx.y) * 524288) + (i_inner_inner * 16384)) +
+             (((int)blockIdx.x) * 64)) +
+            (((int)threadIdx.x) * 2)) +
+           1))] = compute_local[(((i_inner_inner * 2) + 1))];
+    }
+  }
+}
+
 void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K) {
   if (bsz == 1 && M == 2048 && N == 1 && K == 512) {
     dim3 gridDim(1, 256, 1);
@@ -1560,6 +2231,14 @@ void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K) {
     dim3 gridDim(256, 1, 1);
     dim3 blockDim(32, 1, 1);
     batch_matmul_1_4_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
+  } else if (bsz == 1 && M == 64 && N == 2048 && K == 512) {
+    dim3 gridDim(64, 2, 1);
+    dim3 blockDim(16, 2, 1);
+    batch_matmul_1_64_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
+  } else if (bsz == 1 && M == 64 && N == 16384 && K == 512) {
+    dim3 gridDim(256, 1, 1);
+    dim3 blockDim(32, 2, 1);
+    batch_matmul_1_64_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
   } else {
     printf("batch_matmul: WRONG ARGS (bsz=%d, M=%d, N=%d, K=%d)", bsz, M, N, K);
     exit(-1);
