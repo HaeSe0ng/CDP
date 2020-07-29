@@ -108,13 +108,13 @@ def main(argv):
     # We measure 5 times and take average to reduce variance.
     measure_option = autotvm.measure_option(
         builder=autotvm.LocalBuilder(),
-        runner=autotvm.LocalRunner(repeat=3, min_repeat_ms=150, timeout=4)
+        runner=autotvm.LocalRunner(repeat=5, min_repeat_ms=200, timeout=4)
     )
 
     # Begin tuning with RandomTuner, log records to file `matmul.log`
     # You can use alternatives like XGBTuner.
     tuner = autotvm.tuner.XGBTuner(task)
-    tuner.tune(n_trial=1000,
+    tuner.tune(n_trial=2000,
                measure_option=measure_option,
                callbacks=[autotvm.callback.log_to_file(f'matmul_{args_to_str}.log')])
 
@@ -152,7 +152,7 @@ def main(argv):
 
     # Evaluate running time. Here we choose a large repeat number (400) to reduce the noise
     # and the overhead of kernel launch. You can also use nvprof to validate the result.
-    evaluator = func.time_evaluator(func.entry_name, ctx, number=400)
+    evaluator = func.time_evaluator(func.entry_name, ctx, number=500)
     print('Time cost of this operator: %f' %
           evaluator(a_tvm, b_tvm, c_tvm).mean)
 

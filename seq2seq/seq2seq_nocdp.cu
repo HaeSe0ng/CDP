@@ -1,49 +1,71 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_device_runtime_api.h>
 #include <stdio.h>
 
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 
+#include "reduce.cuh"
 #include "seq2seq.h"
+#include "tvm_kernels.cuh"
 #include "util.h"
 
 #define AT_APPLY_THREADS_PER_BLOCK 512
-#define TEMP_OUTPUT_SEQ_LENGTH 15
-extern __global__ void
-batch_matmul_1_2048_1_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                 void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_2048_1_256_kernel(void *__restrict__ A, void *__restrict__ B,
-                                 void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_16384_1_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                  void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_256_1_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                void *__restrict__ compute);
-extern __global__ void
-batch_matmul_64_2048_1_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                  void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_1_2048_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                 void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_1_16384_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                  void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_4_2048_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                 void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_4_16384_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                  void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_64_2048_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                  void *__restrict__ compute);
-extern __global__ void
-batch_matmul_1_64_16384_512_kernel(void *__restrict__ A, void *__restrict__ B,
-                                   void *__restrict__ compute);
+#define TEMP_OUTPUT_SEQ_LENGTH 18
+
+void argmax(float *input_d, int64_t *output_d, int bsz, int input_len) {
+  int num_outputs = bsz;
+  int inputs_per_output = input_len;
+
+  // using traits = function_traits<decltype(&ArgMaxOps<float>::reduce)>;
+  // using arg_t = typename decay<typename traits::template arg<0>::type>::type;
+  static constexpr int vt0 = 4;
+  auto ident =
+      thrust::pair<float, int64_t>(at::numeric_limits<float>::lower_bound(), 0);
+
+  auto config = ReduceConfig(16, num_outputs, inputs_per_output);
+  config.set_block_dimension(inputs_per_output, num_outputs);
+  int block_width = config.block_width;
+  int block_height = config.block_height;
+  config.input_mult[0] = config.split_input(block_width);
+  if (config.values_per_thread() >= block_height * 16 ||
+      config.values_per_thread() >= 256) {
+    config.input_mult[1] = config.split_input(block_height);
+  } else {
+    config.output_mult[1] = config.split_output(block_height);
+  }
+
+  int num_reduce_dims = 1;
+  int num_output_dims = 1;
+  int64_t output_strides[2] = {0, sizeof(int64_t)};
+  int64_t input_strides[2] = {sizeof(float),
+                              (int64_t)sizeof(float) * inputs_per_output};
+  int64_t *output_calc_strides[2] = {
+      output_strides + num_reduce_dims,
+      input_strides + num_reduce_dims,
+  };
+  int64_t *input_calc_strides[1] = {
+      input_strides,
+  };
+  int64_t shape[2] = {inputs_per_output, num_outputs};
+  auto output_calc = OffsetCalculator<2, uint32_t>(
+      num_output_dims, shape + num_reduce_dims, &output_calc_strides[0]);
+  auto input_calc = OffsetCalculator<1, uint32_t>(num_reduce_dims, shape,
+                                                  &input_calc_strides[0]);
+
+  auto reduce = ReduceOp<float, ArgMaxOps<float>, uint32_t, int64_t, vt0>(
+      ArgMaxOps<float>{}, config, input_calc, output_calc,
+      (const void *)input_d, (char *)output_d, nullptr, nullptr, nullptr, ident,
+      1);
+  reduce.accumulate = false;
+  reduce.final_output = true;
+
+  launch_reduce_kernel<ReduceConfig::MAX_NUM_THREADS>(config, reduce);
+
+  cudaError_t err = cudaGetLastError();
+  if (cudaSuccess != err)
+    printf("*cudaErr(%d) : %s \n", err, cudaGetErrorString(err));
+}
 
 void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K);
 
@@ -52,8 +74,6 @@ template <typename T> __device__ __forceinline__ T sigmoid(T in) {
   return one / (one + exp(-in));
 }
 
-__global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
-                              int K) {}
 // bias1: input_bias, bias2: hidden_bias, cx: last cell state, hsz: hidden_size
 __global__ void lstm_cell_kernel(float *input, float *hidden, float *bias1,
                                  float *bias2, float *_cx, float *_hy,
@@ -105,14 +125,14 @@ __global__ void lstm_cell_kernel(float *input, float *hidden, float *bias1,
     *cy = f_cy;
   }
 }
-__global__ void argmax_kernel(float *input_d, int *output_d, int bsz,
-                              int input_len) {
+__global__ void argmax_naive_kernel(float *input_d, int64_t *output_d, int bsz,
+                                    int64_t input_len) {
   float temp_topv, temp_v;
-  int temp_topi;
+  int64_t temp_topi;
   for (int b = 0; b < bsz; b++) {
     temp_topv = 0;
     temp_topi = 0;
-    for (int vocab_idx = 0; vocab_idx < input_len; vocab_idx++) {
+    for (int64_t vocab_idx = 0; vocab_idx < input_len; vocab_idx++) {
       temp_v = input_d[b * input_len + vocab_idx];
       if (temp_v > temp_topv) {
         temp_topi = vocab_idx;
@@ -137,17 +157,17 @@ void lstm(float *input_d, float *hidden_d, float *w_ih_d, float *w_hh_d,
       igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
       totalElements);
 }
-void embedding(int *input, int emb_dim, int bsz, float *emb_tbl_d,
+void embedding(int64_t *input, int emb_dim, int bsz, float *emb_tbl_d,
                float *emb_vec_d) {
   for (int b = 0; b < bsz; b++) {
     cudaMemcpy(emb_vec_d + b * emb_dim, emb_tbl_d + input[b] * emb_dim,
                (sizeof(float) * emb_dim), cudaMemcpyDeviceToDevice);
   }
 }
-void argmax(float *input_d, int *output_d, int bsz, int input_len) {
-  argmax_kernel<<<1, 1>>>(input_d, output_d, bsz, input_len);
+void argmax_naive(float *input_d, int64_t *output_d, int bsz, int input_len) {
+  argmax_naive_kernel<<<1, 1>>>(input_d, output_d, bsz, (int64_t)input_len);
 }
-void seq2seq_encode(int *input, float *emb_tbl_d, float *emb_vec_d,
+void seq2seq_encode(int64_t *input, float *emb_tbl_d, float *emb_vec_d,
                     float *hidden_d, float *w_ih_d, float *w_hh_d,
                     float *igate_d, float *hgate_d, float *b_ih_d,
                     float *b_hh_d, float *cell_d, float *w_ho_d, int bsz,
@@ -155,7 +175,18 @@ void seq2seq_encode(int *input, float *emb_tbl_d, float *emb_vec_d,
                     int seq_length) {
   for (int i = 0; i < seq_length; i++) {
     embedding(input + i * bsz, emb_dim, bsz, emb_tbl_d, emb_vec_d);
+    /*
+    float *emb_vec;
+    alloc_mat<float>(&emb_vec, bsz, emb_dim);
+    cudaMemcpy(emb_vec, emb_vec_d + bsz * emb_dim * i,
+               (sizeof(float) * bsz * emb_dim), cudaMemcpyDeviceToHost);
 
+    for (int ii = 0; ii < bsz; ii++) {
+      for (int jj = 0; jj < 10; jj++)
+        printf("%+.3f ", emb_vec[ii * emb_dim + jj]);
+      printf("\n");
+    }
+    free(emb_vec);*/
     lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
          cell_d, bsz, emb_dim, hidden_size, totalElements);
   }
@@ -164,9 +195,10 @@ void seq2seq_decode_save(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
                          float *w_ih_d, float *w_hh_d, float *igate_d,
                          float *hgate_d, float *b_ih_d, float *b_hh_d,
                          float *cell_d, float *output_onehot_d, float *w_ho_d,
-                         int *output_d, int *output, int *eos, int bsz,
-                         int emb_dim, int hidden_size, int totalElements,
-                         int tgt_vocab_size, int max_len, int *sos_batch) {
+                         int64_t *output_d, int64_t *output, int64_t *eos,
+                         int bsz, int emb_dim, int hidden_size,
+                         int totalElements, int tgt_vocab_size, int max_len,
+                         int64_t *sos_batch) {
   ofstream out;
   char out_fname[20];
   sprintf(out_fname, "out_%d.dat", bsz);
@@ -182,9 +214,9 @@ void seq2seq_decode_save(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
     batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
                  1, bsz, tgt_vocab_size,
                  hidden_size); // bsz, tgt_vocab_size, hidden_size
-    argmax(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i, bsz,
-           tgt_vocab_size);
-    cudaMemcpy(output + bsz * i, output_d + bsz * i, (sizeof(int) * bsz),
+    argmax_naive(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i,
+                 bsz, tgt_vocab_size);
+    cudaMemcpy(output + bsz * i, output_d + bsz * i, (sizeof(int64_t) * bsz),
                cudaMemcpyDeviceToHost);
     /*
         float *output_onehot;
@@ -200,20 +232,20 @@ void seq2seq_decode_save(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
         }
         free(output_onehot);*/
   }
-  int *output_eos = output + (i - 1) * bsz;
+  int64_t *output_eos = output + (i - 1) * bsz;
   for (int b = 0; b < bsz; b++) {
-    printf("b=%d, eos=%d\n", b, output_eos[b]);
+    printf("b=%d, eos=%ld\n", b, output_eos[b]);
   }
-  out.write(reinterpret_cast<const char *>(output_eos), sizeof(int) * bsz);
+  out.write(reinterpret_cast<const char *>(output_eos), sizeof(int64_t) * bsz);
   out.close();
 }
 void seq2seq_decode(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
                     float *w_ih_d, float *w_hh_d, float *igate_d,
                     float *hgate_d, float *b_ih_d, float *b_hh_d, float *cell_d,
-                    float *output_onehot_d, float *w_ho_d, int *output_d,
-                    int *output, int *eos, int bsz, int emb_dim,
-                    int hidden_size, int totalElements, int tgt_vocab_size,
-                    int max_len, int *sos_batch) {
+                    float *output_onehot_d, float *w_ho_d, int64_t *output_d,
+                    int64_t *output, int64_t *eos, int bsz, int emb_dim,
+                    int hidden_size, int totalElements, int64_t tgt_vocab_size,
+                    int max_len, int64_t *sos_batch) {
   int i;
   bool is_end;
   for (i = 0; i < max_len; i++) {
@@ -227,33 +259,38 @@ void seq2seq_decode(float *emb_tbl_d, float *emb_vec_d, float *hidden_d,
     batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
                  1, bsz, tgt_vocab_size,
                  hidden_size); // bsz, tgt_vocab_size, hidden_size
+    cudaError_t err = cudaGetLastError();
+    if (cudaSuccess != err)
+      printf("*[i=%d] encode_cudaErr(%d) : %s \n", i, err,
+             cudaGetErrorString(err));
     argmax(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i, bsz,
            tgt_vocab_size);
-    cudaMemcpy(output + bsz * i, output_d + bsz * i, (sizeof(int) * bsz),
+    cudaMemcpy(output + bsz * i, output_d + bsz * i, (sizeof(int64_t) * bsz),
                cudaMemcpyDeviceToHost);
     for (int b = 0; b < bsz; b++) {
-      // printf("i=%d, output[%d]=%d, eos[%d]=%d\n", i, bsz * i + b,
-      //       output[bsz * i + b], b, eos[b]);
+      // printf("i=%d, output[%d]=%ld, eos[%d]=%ld\n", i, bsz * i + b,
+      //     output[bsz * i + b], b, eos[b]);
       if (output[bsz * i + b] != eos[b]) {
         is_end = false;
         break;
       }
     }
     if (is_end) {
-      printf("end: out_seq_len=%d\n", i + 1);
+      i++;
       break;
     }
   }
+  printf("end: out_seq_len=%d\n", i);
 }
-int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
-                int seq_length, int hidden_size, int batch_size,
+int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
+                int emb_dim, int seq_length, int hidden_size, int batch_size,
                 int src_vocab_size, int tgt_vocab_size, int max_len) {
-  cudaMallocHost((void **)&output, sizeof(int) * batch_size * max_len);
-  int *sos_batch;
+  cudaMallocHost((void **)&output, sizeof(int64_t) * batch_size * max_len);
+  int64_t *sos_batch;
   alloc_mat(&sos_batch, 1, batch_size);
   memset_mat(sos_batch, sos, 1, batch_size);
   int totalElements = batch_size * hidden_size;
-  int *output_d;
+  int64_t *output_d;
   float *w_ih_enc, *w_hh_enc, *b_ih_enc, *b_hh_enc;
   float *w_ih_dec, *w_hh_dec, *b_ih_dec, *b_hh_dec, *w_ho;
   float *emb_tbl_enc, *emb_tbl_dec;
@@ -277,7 +314,7 @@ int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
 
   cudaMalloc((void **)&output_onehot_d,
              sizeof(float) * batch_size * tgt_vocab_size * max_len);
-  cudaMalloc((void **)&output_d, sizeof(int) * batch_size * max_len);
+  cudaMalloc((void **)&output_d, sizeof(int64_t) * batch_size * max_len);
 
   cudaMalloc((void **)&hidden_d, sizeof(float) * batch_size * hidden_size);
   cudaMalloc((void **)&cell_d, sizeof(float) * batch_size * hidden_size);
@@ -401,52 +438,6 @@ int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
 }
 
 void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K) {
-  if (bsz == 1 && M == 2048 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 2, 1);
-    batch_matmul_1_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 2048 && N == 1 && K == 256) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 8, 1);
-    batch_matmul_1_2048_1_256_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 16384 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 16, 1);
-    batch_matmul_1_16384_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 256 && N == 1 && K == 512) {
-    dim3 gridDim(1, 4, 1);
-    dim3 blockDim(1, 32, 1);
-    batch_matmul_1_256_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 64 && M == 2048 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 2, 1);
-    batch_matmul_64_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 1 && N == 2048 && K == 512) {
-    dim3 gridDim(64, 1, 1);
-    dim3 blockDim(8, 1, 1);
-    batch_matmul_1_1_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 1 && N == 16384 && K == 512) {
-    dim3 gridDim(512, 1, 1);
-    dim3 blockDim(32, 1, 1);
-    batch_matmul_1_1_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 4 && N == 2048 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(8, 4, 1);
-    batch_matmul_1_4_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 4 && N == 16384 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(32, 1, 1);
-    batch_matmul_1_4_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 64 && N == 2048 && K == 512) {
-    dim3 gridDim(64, 2, 1);
-    dim3 blockDim(16, 2, 1);
-    batch_matmul_1_64_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 64 && N == 16384 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(32, 2, 1);
-    batch_matmul_1_64_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else {
-    printf("batch_matmul: WRONG ARGS (bsz=%d, M=%d, N=%d, K=%d)", bsz, M, N, K);
-    exit(-1);
-  }
+  auto cfg = matmul_kernel_launch_cfg(bsz, M, N, K);
+  (*(cfg.func))<<<cfg.gridDim, cfg.blockDim>>>(A, B, C);
 }

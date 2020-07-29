@@ -1,4 +1,3 @@
-#include "tvm_kernels.cuh"
 #include <cuda_device_runtime_api.h>
 
 #include <stdio.h>
@@ -7,24 +6,75 @@
 #include <fstream>
 #include <iostream>
 
+#include "reduce_dev.cuh"
 #include "seq2seq.h"
+#include "tvm_kernels.cuh"
 #include "util.h"
 
 #define AT_APPLY_THREADS_PER_BLOCK 512
 
 __device__ int out_seq_len_d = 20;
 
-void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K);
-__device__ void batch_matmul_dev(float *A, float *B, float *C, int bsz, int M,
-                                 int N, int K);
+extern __host__ __device__ void batch_matmul(float *A, float *B, float *C,
+                                             int bsz, int M, int N, int K);
+
+__device__ void argmax_dev(float *input_d, int64_t *output_d, int bsz,
+                           int input_len) {
+  int num_outputs = bsz;
+  int inputs_per_output = input_len;
+
+  static constexpr int vt0 = 4;
+  auto ident =
+      thrust::pair<float, int64_t>(at::numeric_limits<float>::lower_bound(), 0);
+
+  auto config = ReduceConfig(16, num_outputs, inputs_per_output);
+  config.set_block_dimension(inputs_per_output, num_outputs);
+  int block_width = config.block_width;
+  int block_height = config.block_height;
+  config.input_mult[0] = config.split_input(block_width);
+  if (config.values_per_thread() >= block_height * 16 ||
+      config.values_per_thread() >= 256) {
+    config.input_mult[1] = config.split_input(block_height);
+  } else {
+    config.output_mult[1] = config.split_output(block_height);
+  }
+
+  int num_reduce_dims = 1;
+  int num_output_dims = 1;
+  int64_t output_strides[2] = {0, sizeof(int64_t)};
+  int64_t input_strides[2] = {sizeof(float),
+                              (int64_t)sizeof(float) * inputs_per_output};
+  int64_t *output_calc_strides[2] = {
+      output_strides + num_reduce_dims,
+      input_strides + num_reduce_dims,
+  };
+  int64_t *input_calc_strides[1] = {
+      input_strides,
+  };
+  int64_t shape[2] = {inputs_per_output, num_outputs};
+  auto output_calc = OffsetCalculator<2, uint32_t>(
+      num_output_dims, shape + num_reduce_dims, &output_calc_strides[0]);
+  auto input_calc = OffsetCalculator<1, uint32_t>(num_reduce_dims, shape,
+                                                  &input_calc_strides[0]);
+
+  auto reduce = ReduceOp<float, ArgMaxOps<float>, uint32_t, int64_t, vt0>(
+      ArgMaxOps<float>{}, config, input_calc, output_calc,
+      (const void *)input_d, (char *)output_d, nullptr, nullptr, nullptr, ident,
+      1);
+  reduce.accumulate = false;
+  reduce.final_output = true;
+
+  launch_reduce_kernel<ReduceConfig::MAX_NUM_THREADS>(config, reduce);
+
+  cudaError_t err = cudaGetLastError();
+  if (cudaSuccess != err)
+    printf("*cudaErr(%d) : %s \n", err, cudaGetErrorString(err));
+}
 
 template <typename T> __device__ __forceinline__ T sigmoid(T in) {
   T one = static_cast<T>(1.0);
   return one / (one + exp(-in));
 }
-
-__global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
-                              int K) {}
 // bias1: input_bias, bias2: hidden_bias, cx: last cell state, hsz: hidden_size
 __global__ void lstm_cell_kernel(float *input, float *hidden, float *bias1,
                                  float *bias2, float *_cx, float *_hy,
@@ -76,8 +126,8 @@ __global__ void lstm_cell_kernel(float *input, float *hidden, float *bias1,
     *cy = f_cy;
   }
 }
-__global__ void argmax_kernel(float *input_d, int *output_d, int bsz,
-                              int input_len) {
+__global__ void argmax_naive_kernel(float *input_d, int64_t *output_d, int bsz,
+                                    int input_len) {
   float temp_topv, temp_v;
   int temp_topi;
   for (int b = 0; b < bsz; b++) {
@@ -95,10 +145,11 @@ __global__ void argmax_kernel(float *input_d, int *output_d, int bsz,
     // temp_topv);
   }
 }
-void lstm(float *input_d, float *hidden_d, float *w_ih_d, float *w_hh_d,
-          float *igate_d, float *hgate_d, float *b_ih_d, float *b_hh_d,
-          float *cell_d, int bsz, int input_dim, int hidden_size,
-          int totalElements) {
+__host__ __device__ void lstm(float *input_d, float *hidden_d, float *w_ih_d,
+                              float *w_hh_d, float *igate_d, float *hgate_d,
+                              float *b_ih_d, float *b_hh_d, float *cell_d,
+                              int bsz, int input_dim, int hidden_size,
+                              int totalElements) {
   batch_matmul(input_d, w_ih_d, igate_d, 1, bsz, 4 * hidden_size,
                input_dim); // bsz, 4*hidden_size, input_dim
   batch_matmul(hidden_d, w_hh_d, hgate_d, 1, bsz, 4 * hidden_size,
@@ -108,37 +159,25 @@ void lstm(float *input_d, float *hidden_d, float *w_ih_d, float *w_hh_d,
       igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
       totalElements);
 }
-__device__ void lstm_dev(float *input_d, float *hidden_d, float *w_ih_d,
-                         float *w_hh_d, float *igate_d, float *hgate_d,
-                         float *b_ih_d, float *b_hh_d, float *cell_d, int bsz,
-                         int input_dim, int hidden_size, int totalElements) {
-  batch_matmul_dev(input_d, w_ih_d, igate_d, 1, bsz, 4 * hidden_size,
-                   input_dim); // bsz, 4*hidden_size, input_dim
-  batch_matmul_dev(hidden_d, w_hh_d, hgate_d, 1, bsz, 4 * hidden_size,
-                   hidden_size); // bsz, 4*hidden_size, hidden_size
-  lstm_cell_kernel<<<totalElements / AT_APPLY_THREADS_PER_BLOCK,
-                     AT_APPLY_THREADS_PER_BLOCK>>>(
-      igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
-      totalElements);
-}
-void embedding(int *input, int emb_dim, int bsz, float *emb_tbl_d,
+void embedding(int64_t *input, int emb_dim, int bsz, float *emb_tbl_d,
                float *emb_vec_d) {
   for (int b = 0; b < bsz; b++) {
     cudaMemcpy(emb_vec_d + b * emb_dim, emb_tbl_d + input[b] * emb_dim,
                (sizeof(float) * emb_dim), cudaMemcpyDeviceToDevice);
   }
 }
-__device__ void embedding_dev(int *input_d, int emb_dim, int bsz,
+__device__ void embedding_dev(int64_t *input_d, int emb_dim, int bsz,
                               float *emb_tbl_d, float *emb_vec_d) {
   for (int b = 0; b < bsz; b++) {
     memcpy(emb_vec_d + b * emb_dim, emb_tbl_d + input_d[b] * emb_dim,
            (sizeof(float) * emb_dim));
   }
 }
-__device__ void argmax_dev(float *input, int *output, int bsz, int input_len) {
-  argmax_kernel<<<1, 1>>>(input, output, bsz, input_len);
+__device__ void argmax_naive_dev(float *input, int64_t *output, int bsz,
+                                 int input_len) {
+  argmax_naive_kernel<<<1, 1>>>(input, output, bsz, input_len);
 }
-void seq2seq_encode(int *input, float *emb_tbl_d, float *emb_vec_d,
+void seq2seq_encode(int64_t *input, float *emb_tbl_d, float *emb_vec_d,
                     float *hidden_d, float *w_ih_d, float *w_hh_d,
                     float *igate_d, float *hgate_d, float *b_ih_d,
                     float *b_hh_d, float *cell_d, float *w_ho_d, int bsz,
@@ -155,9 +194,9 @@ void seq2seq_encode(int *input, float *emb_tbl_d, float *emb_vec_d,
 __global__ void seq2seq_decode(
     float *emb_tbl_d, float *emb_vec_d, float *hidden_d, float *w_ih_d,
     float *w_hh_d, float *igate_d, float *hgate_d, float *b_ih_d, float *b_hh_d,
-    float *cell_d, float *output_onehot_d, float *w_ho_d, int *output_d,
-    int *output, int *eos_d, int bsz, int emb_dim, int hidden_size,
-    int totalElements, int tgt_vocab_size, int max_len, int *sos_batch_d) {
+    float *cell_d, float *output_onehot_d, float *w_ho_d, int64_t *output_d,
+    int64_t *output, int64_t *eos_d, int bsz, int emb_dim, int hidden_size,
+    int totalElements, int tgt_vocab_size, int max_len, int64_t *sos_batch_d) {
   int i;
   bool is_end;
   for (i = 0; i < max_len; i++) {
@@ -167,41 +206,43 @@ __global__ void seq2seq_decode(
     else
       embedding_dev(output_d + bsz * (i - 1), emb_dim, bsz, emb_tbl_d,
                     emb_vec_d);
-    lstm_dev(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d,
-             b_hh_d, cell_d, bsz, emb_dim, hidden_size, totalElements);
-    batch_matmul_dev(hidden_d, w_ho_d,
-                     output_onehot_d + bsz * tgt_vocab_size * i, 1, bsz,
-                     tgt_vocab_size,
-                     hidden_size); // bsz, tgt_vocab_size, hidden_size
+    lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
+         cell_d, bsz, emb_dim, hidden_size, totalElements);
+    batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
+                 1, bsz, tgt_vocab_size,
+                 hidden_size); // bsz, tgt_vocab_size, hidden_size
+
     argmax_dev(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i,
                bsz, tgt_vocab_size);
     cudaDeviceSynchronize();
+
     //__syncthreads();
     for (int b = 0; b < bsz; b++) {
       // printf("i=%d, output_d[%d]=%d, eos_d[%d]=%d\n", i, bsz * i + b,
-      //       output_d[bsz * i + b], b, eos_d[b]);
+      //      output_d[bsz * i + b], b, eos_d[b]);
       if (output_d[bsz * i + b] != eos_d[b]) {
         is_end = false;
         break;
       }
     }
     if (is_end) {
-      printf("end: out_seq_len=%d\n", i + 1);
-      out_seq_len_d = i + 1;
+      i++;
       break;
     }
   }
+  printf("end: out_seq_len=%d\n", i);
+  out_seq_len_d = i;
 }
-int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
-                int seq_length, int hidden_size, int batch_size,
+int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
+                int emb_dim, int seq_length, int hidden_size, int batch_size,
                 int src_vocab_size, int tgt_vocab_size, int max_len) {
-  cudaMallocHost((void **)&output, sizeof(int) * batch_size * max_len);
-  int *sos_batch_d;
-  cudaMalloc((void **)&sos_batch_d, sizeof(int) * batch_size);
-  cudaMemset(sos_batch_d, sos, sizeof(int) * batch_size);
+  cudaMallocHost((void **)&output, sizeof(int64_t) * batch_size * max_len);
+  int64_t *sos_batch_d;
+  cudaMalloc((void **)&sos_batch_d, sizeof(int64_t) * batch_size);
+  cudaMemset(sos_batch_d, sos, sizeof(int64_t) * batch_size);
 
   int totalElements = batch_size * hidden_size;
-  int *output_d, *eos_d;
+  int64_t *output_d, *eos_d;
   float *w_ih_enc, *w_hh_enc, *b_ih_enc, *b_hh_enc;
   float *w_ih_dec, *w_hh_dec, *b_ih_dec, *b_hh_dec, *w_ho;
   float *emb_tbl_enc, *emb_tbl_dec;
@@ -210,8 +251,9 @@ int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
   float *w_ih_dec_d, *w_hh_dec_d, *b_ih_dec_d, *b_hh_dec_d, *w_ho_d;
   float *output_onehot_d, *emb_tbl_enc_d, *emb_tbl_dec_d, *emb_vec_d;
 
-  cudaMalloc((void **)&eos_d, sizeof(int) * batch_size);
-  cudaMemcpy(eos_d, eos, (sizeof(int) * batch_size), cudaMemcpyHostToDevice);
+  cudaMalloc((void **)&eos_d, sizeof(int64_t) * batch_size);
+  cudaMemcpy(eos_d, eos, (sizeof(int64_t) * batch_size),
+             cudaMemcpyHostToDevice);
 
   alloc_rand_mat<float>(&emb_tbl_enc, src_vocab_size, emb_dim);
   cudaMalloc((void **)&emb_tbl_enc_d, sizeof(float) * src_vocab_size * emb_dim);
@@ -228,7 +270,7 @@ int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
 
   cudaMalloc((void **)&output_onehot_d,
              sizeof(float) * batch_size * tgt_vocab_size * max_len);
-  cudaMalloc((void **)&output_d, sizeof(int) * batch_size * max_len);
+  cudaMalloc((void **)&output_d, sizeof(int64_t) * batch_size * max_len);
 
   cudaMalloc((void **)&hidden_d, sizeof(float) * batch_size * hidden_size);
   cudaMalloc((void **)&cell_d, sizeof(float) * batch_size * hidden_size);
@@ -319,7 +361,7 @@ int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
 
   cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
                        cudaMemcpyDeviceToHost);
-  cudaMemcpy(output, output_d, (sizeof(int) * batch_size * out_seq_len),
+  cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
              cudaMemcpyDeviceToHost);
 
   cudaEventRecord(stop);
@@ -363,103 +405,8 @@ int seq2seq_inf(int *input, int *output, int sos, int *eos, int emb_dim,
   return 0;
 }
 
-void batch_matmul(float *A, float *B, float *C, int bsz, int M, int N, int K) {
-  if (bsz == 1 && M == 2048 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 2, 1);
-    batch_matmul_1_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 2048 && N == 1 && K == 256) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 8, 1);
-    batch_matmul_1_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 16384 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 16, 1);
-    batch_matmul_1_16384_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 256 && N == 1 && K == 512) {
-    dim3 gridDim(1, 4, 1);
-    dim3 blockDim(1, 32, 1);
-    batch_matmul_1_256_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 64 && M == 2048 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 2, 1);
-    batch_matmul_64_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 1 && N == 2048 && K == 512) {
-    dim3 gridDim(64, 1, 1);
-    dim3 blockDim(8, 1, 1);
-    batch_matmul_1_1_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 1 && N == 16384 && K == 512) {
-    dim3 gridDim(512, 1, 1);
-    dim3 blockDim(32, 1, 1);
-    batch_matmul_1_1_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 4 && N == 2048 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(8, 4, 1);
-    batch_matmul_1_4_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 4 && N == 16384 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(32, 1, 1);
-    batch_matmul_1_4_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 64 && N == 2048 && K == 512) {
-    dim3 gridDim(64, 2, 1);
-    dim3 blockDim(16, 2, 1);
-    batch_matmul_1_64_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 64 && N == 16384 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(32, 2, 1);
-    batch_matmul_1_64_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else {
-    printf("batch_matmul: WRONG ARGS (bsz=%d, M=%d, N=%d, K=%d)", bsz, M, N, K);
-    exit(-1);
-  }
-}
-__device__ void batch_matmul_dev(float *A, float *B, float *C, int bsz, int M,
-                                 int N, int K) {
-  if (bsz == 1 && M == 2048 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 2, 1);
-    batch_matmul_1_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 2048 && N == 1 && K == 256) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 8, 1);
-    batch_matmul_1_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 16384 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 16, 1);
-    batch_matmul_1_16384_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 256 && N == 1 && K == 512) {
-    dim3 gridDim(1, 4, 1);
-    dim3 blockDim(1, 32, 1);
-    batch_matmul_1_256_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 64 && M == 2048 && N == 1 && K == 512) {
-    dim3 gridDim(1, 256, 1);
-    dim3 blockDim(1, 2, 1);
-    batch_matmul_64_2048_1_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 1 && N == 2048 && K == 512) {
-    dim3 gridDim(64, 1, 1);
-    dim3 blockDim(8, 1, 1);
-    batch_matmul_1_1_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 1 && N == 16384 && K == 512) {
-    dim3 gridDim(512, 1, 1);
-    dim3 blockDim(32, 1, 1);
-    batch_matmul_1_1_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 4 && N == 2048 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(8, 4, 1);
-    batch_matmul_1_4_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 4 && N == 16384 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(32, 1, 1);
-    batch_matmul_1_4_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 64 && N == 2048 && K == 512) {
-    dim3 gridDim(64, 2, 1);
-    dim3 blockDim(16, 2, 1);
-    batch_matmul_1_64_2048_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else if (bsz == 1 && M == 64 && N == 16384 && K == 512) {
-    dim3 gridDim(256, 1, 1);
-    dim3 blockDim(32, 2, 1);
-    batch_matmul_1_64_16384_512_kernel<<<gridDim, blockDim>>>(A, B, C);
-  } else {
-    printf("batch_matmul: WRONG ARGS (bsz=%d, M=%d, N=%d, K=%d)", bsz, M, N, K);
-  }
+__host__ __device__ void batch_matmul(float *A, float *B, float *C, int bsz,
+                                      int M, int N, int K) {
+  auto cfg = matmul_kernel_launch_cfg(bsz, M, N, K);
+  (*(cfg.func))<<<cfg.gridDim, cfg.blockDim>>>(A, B, C);
 }
