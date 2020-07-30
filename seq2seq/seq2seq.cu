@@ -230,12 +230,13 @@ __global__ void seq2seq_decode(
       break;
     }
   }
-  printf("end: out_seq_len=%d\n", i);
+  // printf("end: out_seq_len=%d\n", i);
   out_seq_len_d = i;
 }
 int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
                 int emb_dim, int seq_length, int hidden_size, int batch_size,
-                int src_vocab_size, int tgt_vocab_size, int max_len) {
+                int src_vocab_size, int tgt_vocab_size, int max_len,
+                float *res) {
   cudaMallocHost((void **)&output, sizeof(int64_t) * batch_size * max_len);
   int64_t *sos_batch_d;
   cudaMalloc((void **)&sos_batch_d, sizeof(int64_t) * batch_size);
@@ -291,8 +292,6 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
   cudaMalloc((void **)&b_hh_dec_d, sizeof(float) * 4 * hidden_size);
   cudaMalloc((void **)&w_ho_d, sizeof(float) * tgt_vocab_size * hidden_size);
 
-  cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
-  cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
   alloc_rand_mat<float>(&w_ih_enc, (4 * hidden_size), emb_dim);
   alloc_rand_mat<float>(&w_hh_enc, (4 * hidden_size), hidden_size);
   alloc_rand_mat<float>(&b_ih_enc, 1, 4 * hidden_size);
@@ -328,46 +327,75 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
   cudaMemcpy(w_ho_d, w_ho, (sizeof(float) * hidden_size * tgt_vocab_size),
              cudaMemcpyHostToDevice);
 
+  float elapsed_time, elapsed_time_enc = 0, elapsed_time_dec = 0,
+                      elapsed_time_mem = 0;
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-  cudaEventRecord(start);
-  // main logic
-
-  seq2seq_encode(input, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
-                 w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d, cell_d,
-                 w_ho_d, batch_size, emb_dim, hidden_size, totalElements,
-                 seq_length);
-
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  float elapsed_time;
-  cudaEventElapsedTime(&elapsed_time, start, stop);
-  printf("[CDP_encode]execution time: %fms\n", elapsed_time);
-  cudaEventRecord(start);
+  int num_itr = 200;
   int out_seq_len;
-  seq2seq_decode<<<1, 1>>>(emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d,
-                           w_hh_dec_d, igate_d, hgate_d, b_ih_dec_d, b_hh_dec_d,
-                           cell_d, output_onehot_d, w_ho_d, output_d, output,
-                           eos_d, batch_size, emb_dim, hidden_size,
-                           totalElements, tgt_vocab_size, max_len, sos_batch_d);
+  for (int i = -2 * num_itr; i < num_itr; i++) {
+    cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
+    cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
 
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  cudaEventElapsedTime(&elapsed_time, start, stop);
-  printf("[CDP_decode]execution time: %fms\n", elapsed_time);
+    if (i < 0) {
+      seq2seq_encode(input, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
+                     w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
+                     cell_d, w_ho_d, batch_size, emb_dim, hidden_size,
+                     totalElements, seq_length);
+      seq2seq_decode<<<1, 1>>>(
+          emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
+          hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
+          output_d, output, eos_d, batch_size, emb_dim, hidden_size,
+          totalElements, tgt_vocab_size, max_len, sos_batch_d);
+      cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
+                           cudaMemcpyDeviceToHost);
+      cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
+                 cudaMemcpyDeviceToHost);
+    } else {
+      cudaEventRecord(start);
 
-  cudaEventRecord(start);
+      seq2seq_encode(input, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
+                     w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
+                     cell_d, w_ho_d, batch_size, emb_dim, hidden_size,
+                     totalElements, seq_length);
 
-  cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
-                       cudaMemcpyDeviceToHost);
-  cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
-             cudaMemcpyDeviceToHost);
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&elapsed_time, start, stop);
+      elapsed_time_enc += elapsed_time;
 
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  cudaEventElapsedTime(&elapsed_time, start, stop);
-  printf("[CDP_decode_memcpy]execution time: %fms\n", elapsed_time);
+      cudaEventRecord(start);
+
+      seq2seq_decode<<<1, 1>>>(
+          emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
+          hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
+          output_d, output, eos_d, batch_size, emb_dim, hidden_size,
+          totalElements, tgt_vocab_size, max_len, sos_batch_d);
+
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&elapsed_time, start, stop);
+      elapsed_time_dec += elapsed_time;
+
+      cudaEventRecord(start);
+      cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
+                           cudaMemcpyDeviceToHost);
+      cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
+                 cudaMemcpyDeviceToHost);
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&elapsed_time, start, stop);
+      elapsed_time_mem += elapsed_time;
+    }
+  }
+  elapsed_time_enc /= num_itr;
+  elapsed_time_dec /= num_itr;
+  elapsed_time_mem /= num_itr;
+  res[0] = elapsed_time_enc;
+  res[1] = elapsed_time_dec + elapsed_time_mem;
+  res[2] = elapsed_time_mem;
+
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
