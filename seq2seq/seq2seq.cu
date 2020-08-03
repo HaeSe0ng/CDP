@@ -1,4 +1,5 @@
 #include <cuda_device_runtime_api.h>
+#include <cuda_runtime_api.h>
 
 #include <stdio.h>
 
@@ -8,10 +9,9 @@
 
 #include "reduce_dev.cuh"
 #include "seq2seq.h"
+#include "torch_kernels.cuh"
 #include "tvm_kernels.cuh"
 #include "util.h"
-
-#define AT_APPLY_THREADS_PER_BLOCK 512
 
 __device__ int out_seq_len_d = 20;
 
@@ -65,67 +65,13 @@ __device__ void argmax_dev(float *input_d, int64_t *output_d, int bsz,
   reduce.final_output = true;
 
   launch_reduce_kernel<ReduceConfig::MAX_NUM_THREADS>(config, reduce);
-
+  /*
   cudaError_t err = cudaGetLastError();
   if (cudaSuccess != err)
     printf("*cudaErr(%d) : %s \n", err, cudaGetErrorString(err));
+    */
 }
 
-template <typename T> __device__ __forceinline__ T sigmoid(T in) {
-  T one = static_cast<T>(1.0);
-  return one / (one + exp(-in));
-}
-// bias1: input_bias, bias2: hidden_bias, cx: last cell state, hsz: hidden_size
-__global__ void lstm_cell_kernel(float *input, float *hidden, float *bias1,
-                                 float *bias2, float *_cx, float *_hy,
-                                 float *_cy, int hsz, int totalElements) {
-  for (int linearIndex = blockIdx.x * blockDim.x + threadIdx.x;
-       linearIndex < totalElements; linearIndex += gridDim.x * blockDim.x) {
-    int offset = (linearIndex / hsz) * 4 * hsz + linearIndex % hsz;
-
-    float iig = input[offset + 0 * hsz];
-    float ifg = input[offset + 1 * hsz];
-    float icg = input[offset + 2 * hsz];
-    float iog = input[offset + 3 * hsz];
-
-    float hig = hidden[offset + 0 * hsz];
-    float hfg = hidden[offset + 1 * hsz];
-    float hcg = hidden[offset + 2 * hsz];
-    float hog = hidden[offset + 3 * hsz];
-
-    float cx = _cx[linearIndex];
-
-    float *hy = &_hy[linearIndex];
-    float *cy = &_cy[linearIndex];
-
-    float b1i, b1f, b1c, b1o;
-    float b2i, b2f, b2c, b2o;
-
-    b1i = bias1[linearIndex % hsz + 0 * hsz];
-    b1f = bias1[linearIndex % hsz + 1 * hsz];
-    b1c = bias1[linearIndex % hsz + 2 * hsz];
-    b1o = bias1[linearIndex % hsz + 3 * hsz];
-
-    b2i = bias2[linearIndex % hsz + 0 * hsz];
-    b2f = bias2[linearIndex % hsz + 1 * hsz];
-    b2c = bias2[linearIndex % hsz + 2 * hsz];
-    b2o = bias2[linearIndex % hsz + 3 * hsz];
-
-    float ig, fg, cg, og;
-    float f_hy, f_cy;
-
-    ig = sigmoid(iig + hig + b1i + b2i);
-    fg = sigmoid(ifg + hfg + b1f + b2f);
-    cg = tanh(icg + hcg + b1c + b2c);
-    og = sigmoid(iog + hog + b1o + b2o);
-
-    f_cy = (fg * cx) + (ig * cg);
-    f_hy = og * tanh(f_cy);
-
-    *hy = f_hy;
-    *cy = f_cy;
-  }
-}
 __global__ void argmax_naive_kernel(float *input_d, int64_t *output_d, int bsz,
                                     int input_len) {
   float temp_topv, temp_v;
@@ -159,32 +105,53 @@ __host__ __device__ void lstm(float *input_d, float *hidden_d, float *w_ih_d,
       igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
       totalElements);
 }
-void embedding(int64_t *input, int emb_dim, int bsz, float *emb_tbl_d,
-               float *emb_vec_d) {
-  for (int b = 0; b < bsz; b++) {
-    cudaMemcpy(emb_vec_d + b * emb_dim, emb_tbl_d + input[b] * emb_dim,
-               (sizeof(float) * emb_dim), cudaMemcpyDeviceToDevice);
+__host__ __device__ void embedding(int64_t *input_d, int emb_dim, int bsz,
+                                   float *emb_tbl_d, float *emb_vec_d) {
+  ptrdiff_t numIndices = bsz;
+
+  ptrdiff_t outTotalSize = bsz * emb_dim;
+  if (outTotalSize == 0) {
+    return;
+  }
+
+  ptrdiff_t sliceSize = outTotalSize / numIndices;
+  /*
+  cudaDeviceProp prop;
+  int device;
+  cudaGetDevice(&device);
+  cudaGetDeviceProperties(&prop, device);
+  */
+  int mpc = 30; // prop.multiProcessorCount;
+
+  // A reasonable choice for when to have each thread iterate over
+  // indices to choose
+  if (numIndices <= 16) {
+    dim3 smallIndexGrid(
+        MIN(THCCeilDiv(sliceSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
+    dim3 smallIndexBlock(MIN(sliceSize, (ptrdiff_t)128));
+    indexSelectSmallIndex<<<smallIndexGrid, smallIndexBlock, 0>>>(
+        emb_vec_d, emb_tbl_d, input_d, sliceSize, numIndices);
+  } else {
+    dim3 largeIndexGrid(
+        MIN(THCCeilDiv(outTotalSize, (ptrdiff_t)128), (ptrdiff_t)(mpc * 8)));
+    dim3 largeIndexBlock(MIN(outTotalSize, (ptrdiff_t)128));
+    indexSelectLargeIndex<<<largeIndexGrid, largeIndexBlock, 0>>>(
+        emb_vec_d, emb_tbl_d, input_d, outTotalSize, sliceSize);
   }
 }
-__device__ void embedding_dev(int64_t *input_d, int emb_dim, int bsz,
-                              float *emb_tbl_d, float *emb_vec_d) {
-  for (int b = 0; b < bsz; b++) {
-    memcpy(emb_vec_d + b * emb_dim, emb_tbl_d + input_d[b] * emb_dim,
-           (sizeof(float) * emb_dim));
-  }
-}
+
 __device__ void argmax_naive_dev(float *input, int64_t *output, int bsz,
                                  int input_len) {
   argmax_naive_kernel<<<1, 1>>>(input, output, bsz, input_len);
 }
-void seq2seq_encode(int64_t *input, float *emb_tbl_d, float *emb_vec_d,
+void seq2seq_encode(int64_t *input_d, float *emb_tbl_d, float *emb_vec_d,
                     float *hidden_d, float *w_ih_d, float *w_hh_d,
                     float *igate_d, float *hgate_d, float *b_ih_d,
                     float *b_hh_d, float *cell_d, float *w_ho_d, int bsz,
                     int emb_dim, int hidden_size, int totalElements,
                     int seq_length) {
   for (int i = 0; i < seq_length; i++) {
-    embedding(input + i * bsz, emb_dim, bsz, emb_tbl_d, emb_vec_d);
+    embedding(input_d + i * bsz, emb_dim, bsz, emb_tbl_d, emb_vec_d);
 
     lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
          cell_d, bsz, emb_dim, hidden_size, totalElements);
@@ -199,23 +166,21 @@ __global__ void seq2seq_decode(
     int totalElements, int tgt_vocab_size, int max_len, int64_t *sos_batch_d) {
   int i;
   bool is_end;
-  for (i = 0; i < max_len; i++) {
+
+  for (i = 0; i < 16; i++) {
     is_end = true;
     if (i == 0)
-      embedding_dev(sos_batch_d, emb_dim, bsz, emb_tbl_d, emb_vec_d);
+      embedding(sos_batch_d, emb_dim, bsz, emb_tbl_d, emb_vec_d);
     else
-      embedding_dev(output_d + bsz * (i - 1), emb_dim, bsz, emb_tbl_d,
-                    emb_vec_d);
+      embedding(output_d + bsz * (i - 1), emb_dim, bsz, emb_tbl_d, emb_vec_d);
     lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
          cell_d, bsz, emb_dim, hidden_size, totalElements);
     batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
                  1, bsz, tgt_vocab_size,
                  hidden_size); // bsz, tgt_vocab_size, hidden_size
-
     argmax_dev(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i,
                bsz, tgt_vocab_size);
     cudaDeviceSynchronize();
-
     //__syncthreads();
     for (int b = 0; b < bsz; b++) {
       // printf("i=%d, output_d[%d]=%d, eos_d[%d]=%d\n", i, bsz * i + b,
@@ -237,7 +202,13 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
                 int emb_dim, int seq_length, int hidden_size, int batch_size,
                 int src_vocab_size, int tgt_vocab_size, int max_len,
                 float *res) {
+  int64_t *input_d;
+  cudaMalloc((void **)&input_d, sizeof(int64_t) * seq_length * batch_size);
+  cudaMemcpy(input_d, input, (sizeof(int64_t) * seq_length * batch_size),
+             cudaMemcpyHostToDevice);
+
   cudaMallocHost((void **)&output, sizeof(int64_t) * batch_size * max_len);
+
   int64_t *sos_batch_d;
   cudaMalloc((void **)&sos_batch_d, sizeof(int64_t) * batch_size);
   cudaMemset(sos_batch_d, sos, sizeof(int64_t) * batch_size);
@@ -332,73 +303,99 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-  int num_itr = 200;
   int out_seq_len;
-  for (int i = -2 * num_itr; i < num_itr; i++) {
+  bool prof = true;
+
+  if (prof) {
+    int num_itr = 200;
+    for (int i = -num_itr; i < num_itr; i++) {
+      cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
+      cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
+
+      if (i < 0) {
+        seq2seq_encode(input_d, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
+                       w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
+                       cell_d, w_ho_d, batch_size, emb_dim, hidden_size,
+                       totalElements, seq_length);
+        seq2seq_decode<<<1, 1>>>(
+            emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
+            hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
+            output_d, output, eos_d, batch_size, emb_dim, hidden_size,
+            totalElements, tgt_vocab_size, max_len, sos_batch_d);
+      } else {
+
+        cudaEventRecord(start);
+
+        seq2seq_encode(input_d, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
+                       w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
+                       cell_d, w_ho_d, batch_size, emb_dim, hidden_size,
+                       totalElements, seq_length);
+
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&elapsed_time, start, stop);
+        elapsed_time_enc += elapsed_time;
+
+        cudaEventRecord(start);
+
+        seq2seq_decode<<<1, 1>>>(
+            emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
+            hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
+            output_d, output, eos_d, batch_size, emb_dim, hidden_size,
+            totalElements, tgt_vocab_size, max_len, sos_batch_d);
+
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&elapsed_time, start, stop);
+        elapsed_time_dec += elapsed_time;
+
+        cudaEventRecord(start);
+        cudaMemcpyFromSymbolAsync(&out_seq_len, out_seq_len_d,
+                                  sizeof(out_seq_len), 0,
+                                  cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(output, output_d,
+                        (sizeof(int64_t) * batch_size * out_seq_len),
+                        cudaMemcpyDeviceToHost);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&elapsed_time, start, stop);
+        elapsed_time_mem += elapsed_time;
+      }
+    }
+    elapsed_time_enc /= num_itr;
+    elapsed_time_dec /= num_itr;
+    elapsed_time_mem /= num_itr;
+    res[0] = elapsed_time_enc;
+    res[1] = elapsed_time_dec + elapsed_time_mem;
+    res[2] = elapsed_time_mem;
+
+  }
+  // one time execution
+  else {
     cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
     cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
-
-    if (i < 0) {
-      seq2seq_encode(input, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
-                     w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
-                     cell_d, w_ho_d, batch_size, emb_dim, hidden_size,
-                     totalElements, seq_length);
-      seq2seq_decode<<<1, 1>>>(
-          emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
-          hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
-          output_d, output, eos_d, batch_size, emb_dim, hidden_size,
-          totalElements, tgt_vocab_size, max_len, sos_batch_d);
-      cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
-                           cudaMemcpyDeviceToHost);
-      cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
-                 cudaMemcpyDeviceToHost);
-    } else {
-      cudaEventRecord(start);
-
-      seq2seq_encode(input, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
-                     w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
-                     cell_d, w_ho_d, batch_size, emb_dim, hidden_size,
-                     totalElements, seq_length);
-
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      cudaEventElapsedTime(&elapsed_time, start, stop);
-      elapsed_time_enc += elapsed_time;
-
-      cudaEventRecord(start);
-
-      seq2seq_decode<<<1, 1>>>(
-          emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
-          hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
-          output_d, output, eos_d, batch_size, emb_dim, hidden_size,
-          totalElements, tgt_vocab_size, max_len, sos_batch_d);
-
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      cudaEventElapsedTime(&elapsed_time, start, stop);
-      elapsed_time_dec += elapsed_time;
-
-      cudaEventRecord(start);
-      cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
-                           cudaMemcpyDeviceToHost);
-      cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
-                 cudaMemcpyDeviceToHost);
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      cudaEventElapsedTime(&elapsed_time, start, stop);
-      elapsed_time_mem += elapsed_time;
-    }
+    seq2seq_encode(input_d, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
+                   w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d, cell_d,
+                   w_ho_d, batch_size, emb_dim, hidden_size, totalElements,
+                   seq_length);
+    seq2seq_decode<<<1, 1>>>(
+        emb_tbl_dec_d, emb_vec_d, hidden_d, w_ih_dec_d, w_hh_dec_d, igate_d,
+        hgate_d, b_ih_dec_d, b_hh_dec_d, cell_d, output_onehot_d, w_ho_d,
+        output_d, output, eos_d, batch_size, emb_dim, hidden_size,
+        totalElements, tgt_vocab_size, max_len, sos_batch_d);
+    cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len), 0,
+                         cudaMemcpyDeviceToHost);
+    // out_seq_len = 16;
+    cudaMemcpy(output, output_d, (sizeof(int64_t) * batch_size * out_seq_len),
+               cudaMemcpyDeviceToHost);
   }
-  elapsed_time_enc /= num_itr;
-  elapsed_time_dec /= num_itr;
-  elapsed_time_mem /= num_itr;
-  res[0] = elapsed_time_enc;
-  res[1] = elapsed_time_dec + elapsed_time_mem;
-  res[2] = elapsed_time_mem;
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
+  cudaFree(input_d);
+  cudaFree(sos_batch_d);
+  cudaFreeHost(output);
   cudaFree(emb_tbl_enc_d);
   cudaFree(emb_tbl_dec_d);
   cudaFree(output_onehot_d);
@@ -417,7 +414,6 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
   cudaFree(b_hh_dec_d);
   cudaFree(w_ho_d);
 
-  cudaFreeHost(output);
   free(w_ih_enc);
   free(w_hh_enc);
   free(b_ih_enc);

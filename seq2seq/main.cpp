@@ -9,7 +9,8 @@
 #include "seq2seq.h"
 #include "util.h"
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
   if (argc != 5)
     exit(-1);
   int batch_size = stoi(argv[1]);
@@ -18,7 +19,7 @@ int main(int argc, char **argv) {
   int hidden_size = stoi(argv[3]);
   int src_vocab_size = stoi(argv[4]);
   int tgt_vocab_size = stoi(argv[4]);
-  int max_len = 400;
+  int max_len = 150;
   /*
   int batch_size = 4;
   int emb_dim = 512; // embedding_dim
@@ -51,7 +52,8 @@ int main(int argc, char **argv) {
           tgt_vocab_size);
   out.open(out_fname, ios::binary | ios::in);
 
-  for (int b = 0; b < batch_size; b++) {
+  for (int b = 0; b < batch_size; b++)
+  {
     out.read(reinterpret_cast<char *>(&eos[b]), sizeof(int64_t));
   }
 
@@ -64,10 +66,12 @@ int main(int argc, char **argv) {
   float res[3] = {0, 0, 0};
   seq2seq_inf(input, output, sos, eos, emb_dim, seq_length, hidden_size,
               batch_size, src_vocab_size, tgt_vocab_size, max_len, res);
-  printf("[total]time: %f\n[encode]time: %f\n[decode]time: "
-         "%f\n[memcpy]time: "
-         "%f\n[decode_without_memcpy]time: "
-         "%f\n\n",
+  //printf("[total]time: %f\n[encode]time: %f\n[decode]time: "
+  //       "%f\n[memcpy]time: "
+  //       "%f\n[decode_without_memcpy]time: "
+  //       "%f\n\n",
+  //       res[0] + res[1], res[0], res[1], res[2], res[1] - res[2]);
+  printf("%f\n%f\n%f\n%f\n%f\n\n",
          res[0] + res[1], res[0], res[1], res[2], res[1] - res[2]);
   free(input);
   free(eos);
