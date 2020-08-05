@@ -15,15 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 from tvm.contrib.pickle_memoize import memoize
-from topi.util import get_const_tuple
-import topi.testing
+from tvm.topi.util import get_const_tuple
+import tvm.topi.testing
 
 import logging
 import sys
 
 import numpy as np
 import tvm
-import topi
+from tvm import topi
 from tvm import te
 from tvm import autotvm
 
@@ -77,19 +77,18 @@ The whole workflow is illustrated by a matrix multiplication example.
 # apply history best from log file
 def main(argv):
 
-    args_to_str = f'({argv[1]},{argv[2]},{argv[3]},{argv[4]})'
-    print(f'bsz={argv[1]}, m={argv[2]}, n={argv[3]}, k={argv[4]}')
+    args_to_str = f'({argv[1]},{argv[2]},{argv[3]})'
+    print(f'm={argv[1]}, n={argv[2]}, k={argv[3]}')
 
-    bsz = int(argv[1])
-    M = int(argv[2])
-    N = int(argv[3])
-    K = int(argv[4])
-    A = te.placeholder((bsz, M, K), name='A',
+    M = int(argv[1])
+    N = int(argv[2])
+    K = int(argv[3])
+    A = te.placeholder((M, K), name='A',
                        dtype='float32')  # first tensor
-    B = te.placeholder((bsz, N, K), name='B',
+    B = te.placeholder((N, K), name='B',
                        dtype='float32')  # second tensor
     task = autotvm.task.create(
-        "batch_matmul.cuda", args=(A, B), target='cuda')
+        "dense_large_batch.cuda", args=(A, B), target='cuda')
 
     dispatch_context = autotvm.apply_history_best(f'matmul_{args_to_str}.log')
     best_config = dispatch_context.query(task.target, task.workload)
@@ -97,14 +96,14 @@ def main(argv):
 
     with autotvm.apply_history_best(f'matmul_{args_to_str}.log'):
         with tvm.target.create("cuda"):
-            C = topi.cuda.batch_matmul(A, B)
-            s = topi.cuda.schedule_batch_matmul(C)
+            C = topi.cuda.dense_large_batch(A, B)
+            s = topi.cuda.schedule_dense_large_batch(C)
             func = tvm.build(s, [A, B, C])
 
     # check correctness
-    a_np = np.random.uniform(size=(bsz, M, K)).astype('float32')
-    b_np = np.random.uniform(size=(bsz, N, K)).astype('float32')
-    c_np = topi.testing.batch_matmul(a_np, b_np)
+    a_np = np.random.uniform(size=(M, K)).astype('float32')
+    b_np = np.random.uniform(size=(N, K)).astype('float32')
+    c_np = np.dot(a_np, b_np.T)
 
     ctx = tvm.gpu()
     a_tvm = tvm.nd.array(a_np, ctx=ctx)
@@ -117,7 +116,7 @@ def main(argv):
 
     # Evaluate running time. Here we choose a large repeat number (400) to reduce the noise
     # and the overhead of kernel launch. You can also use nvprof to validate the result.
-    evaluator = func.time_evaluator(func.entry_name, ctx, number=400)
+    evaluator = func.time_evaluator(func.entry_name, ctx, number=500)
     print('Time cost of this operator: %f' %
           evaluator(a_tvm, b_tvm, c_tvm).mean)
 

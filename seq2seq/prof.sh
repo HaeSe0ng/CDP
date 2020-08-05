@@ -1,6 +1,6 @@
 #! /bin/bash
 
-for b in 1 4 16 64
+for b in 4
 do
   for seq_len in 16
   do

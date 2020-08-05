@@ -1,6 +1,6 @@
 #! /bin/bash
 
-for b in 4 16 64
+for b in 1 4 16 64
 do
   for vocab_size in 16384 # 32768
   do

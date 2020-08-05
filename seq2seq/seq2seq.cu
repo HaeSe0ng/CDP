@@ -15,8 +15,8 @@
 
 __device__ int out_seq_len_d = 20;
 
-extern __host__ __device__ void batch_matmul(float *A, float *B, float *C,
-                                             int bsz, int M, int N, int K);
+extern __host__ __device__ void matmul(float *A, float *B, float *C, int M,
+                                       int N, int K);
 
 __device__ void argmax_dev(float *input_d, int64_t *output_d, int bsz,
                            int input_len) {
@@ -96,10 +96,10 @@ __host__ __device__ void lstm(float *input_d, float *hidden_d, float *w_ih_d,
                               float *b_ih_d, float *b_hh_d, float *cell_d,
                               int bsz, int input_dim, int hidden_size,
                               int totalElements) {
-  batch_matmul(input_d, w_ih_d, igate_d, 1, bsz, 4 * hidden_size,
-               input_dim); // bsz, 4*hidden_size, input_dim
-  batch_matmul(hidden_d, w_hh_d, hgate_d, 1, bsz, 4 * hidden_size,
-               hidden_size); // bsz, 4*hidden_size, hidden_size
+  matmul(input_d, w_ih_d, igate_d, bsz, 4 * hidden_size,
+         input_dim); // bsz, 4*hidden_size, input_dim
+  matmul(hidden_d, w_hh_d, hgate_d, bsz, 4 * hidden_size,
+         hidden_size); // bsz, 4*hidden_size, hidden_size
   lstm_cell_kernel<<<totalElements / AT_APPLY_THREADS_PER_BLOCK,
                      AT_APPLY_THREADS_PER_BLOCK>>>(
       igate_d, hgate_d, b_ih_d, b_hh_d, cell_d, hidden_d, cell_d, hidden_size,
@@ -144,6 +144,7 @@ __device__ void argmax_naive_dev(float *input, int64_t *output, int bsz,
                                  int input_len) {
   argmax_naive_kernel<<<1, 1>>>(input, output, bsz, input_len);
 }
+
 void seq2seq_encode(int64_t *input_d, float *emb_tbl_d, float *emb_vec_d,
                     float *hidden_d, float *w_ih_d, float *w_hh_d,
                     float *igate_d, float *hgate_d, float *b_ih_d,
@@ -167,7 +168,7 @@ __global__ void seq2seq_decode(
   int i;
   bool is_end;
 
-  for (i = 0; i < 16; i++) {
+  for (i = 0; i < max_len; i++) {
     is_end = true;
     if (i == 0)
       embedding(sos_batch_d, emb_dim, bsz, emb_tbl_d, emb_vec_d);
@@ -175,9 +176,9 @@ __global__ void seq2seq_decode(
       embedding(output_d + bsz * (i - 1), emb_dim, bsz, emb_tbl_d, emb_vec_d);
     lstm(emb_vec_d, hidden_d, w_ih_d, w_hh_d, igate_d, hgate_d, b_ih_d, b_hh_d,
          cell_d, bsz, emb_dim, hidden_size, totalElements);
-    batch_matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i,
-                 1, bsz, tgt_vocab_size,
-                 hidden_size); // bsz, tgt_vocab_size, hidden_size
+    matmul(hidden_d, w_ho_d, output_onehot_d + bsz * tgt_vocab_size * i, bsz,
+           tgt_vocab_size,
+           hidden_size); // bsz, tgt_vocab_size, hidden_size
     argmax_dev(output_onehot_d + bsz * tgt_vocab_size * i, output_d + bsz * i,
                bsz, tgt_vocab_size);
     cudaDeviceSynchronize();
@@ -429,8 +430,8 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
   return 0;
 }
 
-__host__ __device__ void batch_matmul(float *A, float *B, float *C, int bsz,
-                                      int M, int N, int K) {
-  auto cfg = matmul_kernel_launch_cfg(bsz, M, N, K);
+__host__ __device__ void matmul(float *A, float *B, float *C, int M, int N,
+                                int K) {
+  auto cfg = matmul_kernel_launch_cfg(M, N, K);
   (*(cfg.func))<<<cfg.gridDim, cfg.blockDim>>>(A, B, C);
 }

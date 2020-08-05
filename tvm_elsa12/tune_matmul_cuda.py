@@ -15,15 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 from tvm.contrib.pickle_memoize import memoize
-from topi.util import get_const_tuple
-import topi.testing
+from tvm.topi.util import get_const_tuple
+import tvm.topi.testing
 
 import logging
 import sys
 
 import numpy as np
 import tvm
-import topi
+from tvm import topi
 from tvm import te
 
 # the module is called `autotvm`
@@ -42,7 +42,7 @@ def verify_batch_matmul(batch, M, N, K):
     def get_ref_data():
         a_np = np.random.uniform(size=(batch, M, K)).astype(dtype)
         b_np = np.random.uniform(size=(batch, N, K)).astype(dtype)
-        c_np = topi.testing.batch_matmul(a_np, b_np)
+        c_np = tvm.topi.testing.batch_matmul(a_np, b_np)
         return (a_np, b_np, c_np)
     # get the test data
     a_np, b_np, c_np = get_ref_data()
@@ -54,7 +54,7 @@ def verify_batch_matmul(batch, M, N, K):
             return
         print("Running on target: %s" % device)
         with tvm.target.create(device):
-            fcompute, fschedule = topi.testing.dispatch(
+            fcompute, fschedule = tvm.topi.testing.dispatch(
                 device, _batch_matmul_implement)
             out = fcompute(x, y)
             s = fschedule([out])
@@ -71,20 +71,19 @@ def verify_batch_matmul(batch, M, N, K):
 
 def main(argv):
 
-    args_to_str = f'({argv[1]},{argv[2]},{argv[3]},{argv[4]})'
-    print(f'bsz={argv[1]}, m={argv[2]}, n={argv[3]}, k={argv[4]}')
+    args_to_str = f'({argv[1]},{argv[2]},{argv[3]})'
+    print(f'm={argv[1]}, n={argv[2]}, k={argv[3]}')
 
     _batch_matmul_implement = {
         "gpu": (topi.cuda.batch_matmul, topi.cuda.schedule_batch_matmul),
     }
 
-    bsz = int(argv[1])
-    M = int(argv[2])
-    N = int(argv[3])
-    K = int(argv[4])
-    A = te.placeholder((bsz, M, K), name='A',
+    M = int(argv[1])
+    N = int(argv[2])
+    K = int(argv[3])
+    A = te.placeholder((1, M, K), name='A',
                        dtype='float32')  # first tensor
-    B = te.placeholder((bsz, N, K), name='B',
+    B = te.placeholder((1, N, K), name='B',
                        dtype='float32')  # second tensor
     task = autotvm.task.create(
         "batch_matmul.cuda", args=(A, B), target='cuda')
@@ -137,9 +136,9 @@ def main(argv):
             func = tvm.build(s, [A, B, C])
 
     # check correctness
-    a_np = np.random.uniform(size=(bsz, M, K)).astype('float32')
-    b_np = np.random.uniform(size=(bsz, N, K)).astype('float32')
-    c_np = topi.testing.batch_matmul(a_np, b_np)
+    a_np = np.random.uniform(size=(1, M, K)).astype('float32')
+    b_np = np.random.uniform(size=(1, N, K)).astype('float32')
+    c_np = tvm.topi.testing.batch_matmul(a_np, b_np)
 
     ctx = tvm.gpu()
     a_tvm = tvm.nd.array(a_np, ctx=ctx)
