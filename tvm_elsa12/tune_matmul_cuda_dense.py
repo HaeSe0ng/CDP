@@ -92,7 +92,7 @@ def main(argv):
                        dtype='float32')  # first tensor
     B = te.placeholder((N, K), name='B',
                        dtype='float32')  # second tensor
-    if M < -1:
+    if M > -1:
         task = autotvm.task.create(
             "dense_small_batch.cuda", args=(A, B), target='cuda')
     else:
@@ -141,7 +141,7 @@ def main(argv):
     best_config = dispatch_context.query(task.target, task.workload)
     print(best_config)
 
-    if M < -1:
+    if M > -1:
         with autotvm.apply_history_best(f'matmul_{args_to_str}.log'):
             with tvm.target.create("cuda"):
                 C = topi.cuda.dense_small_batch(A, B)

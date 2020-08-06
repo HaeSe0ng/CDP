@@ -2,6 +2,9 @@ import numpy as np
 import torch
 import sys
 
+torch.manual_seed(10)
+torch.cuda.manual_seed_all(10)
+
 max_len = 300
 batch_size = int(sys.argv[1])
 seq_length = int(sys.argv[2])
@@ -22,7 +25,9 @@ weight_ho = torch.randn(vocab_size, hidden_size).cuda()
 sos_batch = torch.zeros(batch_size, dtype=torch.int64).cuda()
 output_saved = torch.zeros(seq_length, batch_size).pin_memory()
 output_cpu = torch.zeros(seq_length, batch_size).pin_memory()
-
+output_cpu.zero_()
+hx.zero_()
+cx.zero_()
 with torch.no_grad():
     emb = torch.nn.Embedding(vocab_size, hidden_size).cuda()
     lstm = torch.nn.LSTMCell(hidden_size, hidden_size, True).cuda()
@@ -38,13 +43,12 @@ with torch.no_grad():
     encode = torch.cuda.Event(enable_timing=True)
     decode = torch.cuda.Event(enable_timing=True)
     memcpy = torch.cuda.Event(enable_timing=True)
-
+    '''
     # encode
     for i in range(seq_length):
         emb_vec = emb(input[i])
         hx, cx = lstm(emb_vec, (hx, cx))
-    enc_hx_out, enc_cx_out = hx, cx
-    # decode (save output)
+    # decode(save output)
     output = sos_batch
     for i in range(seq_length):
         emb_vec = emb(output)
@@ -52,14 +56,26 @@ with torch.no_grad():
         output_onehot = fc(hx)
         output = output_onehot.argmax(1)
         output_saved[i] = output
+    db = {'output_saved': output_saved}
+    torch.save(
+        db, f'out_torch_{batch_size}_{seq_length}_{emb_dim}_{vocab_size}.dat')
+    loaded = torch.load(
+        f'out_torch_{batch_size}_{seq_length}_{emb_dim}_{vocab_size}.dat')
+    print(loaded['output_saved'] == output_saved)
+    '''
+    loaded = torch.load(
+        f'out_torch_{batch_size}_{seq_length}_{emb_dim}_{vocab_size}.dat')
+    output_saved = loaded['output_saved']
+    output_saved_d = output_saved.cuda()
 
     elapsed_time_enc = 0
     elapsed_time_dec = 0
     elapsed_time_mem = 0
     num_itr = 200
-    for itr in range(-num_itr, num_itr):
-        hx = torch.zeros(batch_size, hidden_size, dtype=torch.float).cuda()
-        cx = torch.zeros(batch_size, hidden_size, dtype=torch.float).cuda()
+    for itr in range(-num_itr, 2*num_itr):
+        output_cpu.zero_()
+        hx.zero_()
+        cx.zero_()
         # warmup
         if(itr < 0):
             for i in range(seq_length):
@@ -72,6 +88,25 @@ with torch.no_grad():
                 hx, cx = lstm(emb_vec, (hx, cx))
                 output_onehot = fc(hx)
                 output = output_onehot.argmax(1)
+        elif (itr < num_itr):
+            # encode
+            for i in range(seq_length):
+                emb_vec = emb(input[i])
+                hx, cx = lstm(emb_vec, (hx, cx))
+
+            # decode
+            output = sos_batch
+            start.record()
+            for i in range(max_len):
+                emb_vec = emb(output)
+                hx, cx = lstm(emb_vec, (hx, cx))
+                output_onehot = fc(hx)
+                output = output_onehot.argmax(1)
+                if torch.all(torch.eq(output_saved_d[seq_length-1], output[i])):
+                    break
+            memcpy.record()
+            memcpy.synchronize()
+            elapsed_time_mem += start.elapsed_time(memcpy)
 
         # measure time
         else:
@@ -93,15 +128,14 @@ with torch.no_grad():
                 hx, cx = lstm(emb_vec, (hx, cx))
                 output_onehot = fc(hx)
                 output = output_onehot.argmax(1)
-                decode.record()
                 output_cpu[i].copy_(output, non_blocking=True)
-                memcpy.record()
-                memcpy.synchronize()
                 elapsed_time_mem += decode.elapsed_time(memcpy)
                 if torch.all(torch.eq(output_saved[seq_length-1], output_cpu[i])):
                     break
+            decode.record()
+            decode.synchronize()
+            elapsed_time_dec += start.elapsed_time(decode)
 
-            elapsed_time_dec += start.elapsed_time(memcpy)
     elapsed_time_enc /= num_itr
     elapsed_time_dec /= num_itr
     elapsed_time_mem /= num_itr

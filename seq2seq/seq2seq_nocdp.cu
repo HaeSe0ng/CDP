@@ -308,7 +308,6 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
                 int src_vocab_size, int tgt_vocab_size, int max_len,
                 float *res) {
   cudaMallocHost((void **)&output, sizeof(int64_t) * batch_size * max_len);
-  cudaMemset(output, 0, sizeof(int64_t) * batch_size * max_len);
   int64_t *input_d;
   cudaMalloc((void **)&input_d, sizeof(int64_t) * seq_length * batch_size);
   cudaMemcpy(input_d, input, (sizeof(int64_t) * seq_length * batch_size),
@@ -410,10 +409,15 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
   if (prof) {
 
     int num_itr = 200;
-    for (int i = -num_itr; i < num_itr; i++) {
+    for (int i = -num_itr; i < 2 * num_itr; i++) {
       cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
       cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
-
+      cudaMemset(output_d, 0, sizeof(int64_t) * batch_size * max_len);
+      cudaMemset(output_onehot_d, 0,
+                 sizeof(float) * batch_size * tgt_vocab_size * max_len);
+      cudaMemset(output, 0, sizeof(int64_t) * batch_size * max_len);
+      cudaMemset(igate_d, 0, sizeof(float) * batch_size * (4 * hidden_size));
+      cudaMemset(hgate_d, 0, sizeof(float) * batch_size * (4 * hidden_size));
       if (i < 0) {
         seq2seq_encode(input_d, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
                        w_hh_enc_d, igate_d, hgate_d, b_ih_enc_d, b_hh_enc_d,
@@ -424,6 +428,8 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
                        cell_d, output_onehot_d, w_ho_d, output_d, output, eos,
                        batch_size, emb_dim, hidden_size, totalElements,
                        tgt_vocab_size, max_len, sos_batch_d);
+      } else if (i < num_itr) {
+
       } else {
         cudaEventRecord(start);
 

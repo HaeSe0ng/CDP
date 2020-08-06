@@ -8,10 +8,8 @@
         "handle"
       ], 
       "thread_axis_tags": [
-        "blockIdx.z", 
         "blockIdx.y", 
         "blockIdx.x", 
-        "threadIdx.y", 
         "threadIdx.x"
       ]}}
 }

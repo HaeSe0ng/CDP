@@ -184,8 +184,8 @@ __global__ void seq2seq_decode(
     cudaDeviceSynchronize();
     //__syncthreads();
     for (int b = 0; b < bsz; b++) {
-      // printf("i=%d, output_d[%d]=%d, eos_d[%d]=%d\n", i, bsz * i + b,
-      //      output_d[bsz * i + b], b, eos_d[b]);
+      // printf("i=%d, output_d[%d]=%ld, eos_d[%d]=%ld\n", i, bsz * i + b,
+      //       output_d[bsz * i + b], b, eos_d[b]);
       if (output_d[bsz * i + b] != eos_d[b]) {
         is_end = false;
         break;
@@ -312,6 +312,12 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
     for (int i = -num_itr; i < num_itr; i++) {
       cudaMemset(hidden_d, 0, sizeof(float) * batch_size * hidden_size);
       cudaMemset(cell_d, 0, sizeof(float) * batch_size * hidden_size);
+      cudaMemset(output_d, 0, sizeof(int64_t) * batch_size * max_len);
+      cudaMemset(output_onehot_d, 0,
+                 sizeof(float) * batch_size * tgt_vocab_size * max_len);
+      cudaMemset(output, 0, sizeof(int64_t) * batch_size * max_len);
+      cudaMemset(igate_d, 0, sizeof(float) * batch_size * (4 * hidden_size));
+      cudaMemset(hgate_d, 0, sizeof(float) * batch_size * (4 * hidden_size));
 
       if (i < 0) {
         seq2seq_encode(input_d, emb_tbl_enc_d, emb_vec_d, hidden_d, w_ih_enc_d,
@@ -351,9 +357,8 @@ int seq2seq_inf(int64_t *input, int64_t *output, int64_t sos, int64_t *eos,
         elapsed_time_dec += elapsed_time;
 
         cudaEventRecord(start);
-        cudaMemcpyFromSymbolAsync(&out_seq_len, out_seq_len_d,
-                                  sizeof(out_seq_len), 0,
-                                  cudaMemcpyDeviceToHost);
+        cudaMemcpyFromSymbol(&out_seq_len, out_seq_len_d, sizeof(out_seq_len),
+                             0, cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(output, output_d,
                         (sizeof(int64_t) * batch_size * out_seq_len),
                         cudaMemcpyDeviceToHost);
