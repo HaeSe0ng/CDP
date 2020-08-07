@@ -23,7 +23,7 @@ hx = torch.zeros(batch_size, hidden_size, dtype=torch.float).cuda()
 cx = torch.zeros(batch_size, hidden_size, dtype=torch.float).cuda()
 weight_ho = torch.randn(vocab_size, hidden_size).cuda()
 sos_batch = torch.zeros(batch_size, dtype=torch.int64).cuda()
-output_saved = torch.zeros(seq_length, batch_size).pin_memory()
+output_saved = torch.zeros(batch_size).pin_memory()
 output_cpu = torch.zeros(seq_length, batch_size).pin_memory()
 output_cpu.zero_()
 hx.zero_()
@@ -55,24 +55,24 @@ with torch.no_grad():
         hx, cx = lstm(emb_vec, (hx, cx))
         output_onehot = fc(hx)
         output = output_onehot.argmax(1)
-        output_saved[i] = output
+    output_saved = output.cpu()
     db = {'output_saved': output_saved}
     torch.save(
         db, f'out_torch_{batch_size}_{seq_length}_{emb_dim}_{vocab_size}.dat')
     loaded = torch.load(
         f'out_torch_{batch_size}_{seq_length}_{emb_dim}_{vocab_size}.dat')
     print(loaded['output_saved'] == output_saved)
+    print(output_saved)
     '''
     loaded = torch.load(
         f'out_torch_{batch_size}_{seq_length}_{emb_dim}_{vocab_size}.dat')
     output_saved = loaded['output_saved']
     output_saved_d = output_saved.cuda()
-
     elapsed_time_enc = 0
     elapsed_time_dec = 0
     elapsed_time_mem = 0
     num_itr = 200
-    for itr in range(-num_itr, 2*num_itr):
+    for itr in range(-2*num_itr, 2*num_itr):
         output_cpu.zero_()
         hx.zero_()
         cx.zero_()
@@ -102,7 +102,7 @@ with torch.no_grad():
                 hx, cx = lstm(emb_vec, (hx, cx))
                 output_onehot = fc(hx)
                 output = output_onehot.argmax(1)
-                if torch.all(torch.eq(output_saved_d[seq_length-1], output[i])):
+                if torch.all(torch.eq(output_saved_d, output)):
                     break
             memcpy.record()
             memcpy.synchronize()
@@ -129,8 +129,7 @@ with torch.no_grad():
                 output_onehot = fc(hx)
                 output = output_onehot.argmax(1)
                 output_cpu[i].copy_(output, non_blocking=True)
-                elapsed_time_mem += decode.elapsed_time(memcpy)
-                if torch.all(torch.eq(output_saved[seq_length-1], output_cpu[i])):
+                if torch.all(torch.eq(output_saved, output_cpu[i])):
                     break
             decode.record()
             decode.synchronize()
@@ -139,6 +138,7 @@ with torch.no_grad():
     elapsed_time_enc /= num_itr
     elapsed_time_dec /= num_itr
     elapsed_time_mem /= num_itr
+    elapsed_time_mem = elapsed_time_dec-elapsed_time_mem
     print(elapsed_time_enc + elapsed_time_dec)
     print(elapsed_time_enc)
     print(elapsed_time_dec)
